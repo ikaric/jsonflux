@@ -1,0 +1,1233 @@
+<div align="center">
+
+# 📊 JSONFlux
+
+**High-performance JSON structure analysis and SQL querying for Python**
+
+[![Python](https://img.shields.io/badge/Python-3.9+-3776AB?logo=python&logoColor=white)](https://python.org)
+[![DuckDB](https://img.shields.io/badge/DuckDB-SQL%20Engine-FFF000?logo=duckdb&logoColor=black)](https://duckdb.org)
+[![msgspec](https://img.shields.io/badge/msgspec-Fast%20JSON-5B4FC3)](https://jcristharif.com/msgspec/)
+[![PyArrow](https://img.shields.io/badge/PyArrow-Zero%20Copy-E34F26)](https://arrow.apache.org/docs/python/)
+[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+*Analyze JSON structure, visualize schemas, and query with SQL — all in one library.*
+
+[Quick Start](#-quick-start) •
+[Structure Analysis](#-structure-analysis) •
+[SQL Queries](#-sql-queries) •
+[LLM Integration](#-llm-integration) •
+[Configuration](#%EF%B8%8F-configuration)
+
+</div>
+
+---
+
+## ✨ Features
+
+| Feature | Description |
+|---------|-------------|
+| 🔍 **Structure Analysis** | Analyze JSON to reveal types, nesting, and patterns |
+| 🌳 **Tree Visualization** | Multiple formats: tree, tabs, bracket, and compact schema |
+| 📊 **Statistics** | Comprehensive stats: counts, sizes, distributions, nulls |
+| 🔎 **SQL Queries** | Query JSON with full DuckDB SQL (JOINs, CTEs, window functions) |
+| 🚀 **High Performance** | msgspec for parsing, Arrow for zero-copy data transfer |
+| 🤖 **LLM-Optimized** | Token-efficient schemas perfect for AI context |
+| 📁 **Multiple Sources** | Load from dicts, lists, strings, or files |
+
+---
+
+## 📑 Table of Contents
+
+- [Quick Start](#-quick-start)
+- [Installation](#-installation)
+- [Structure Analysis](#-structure-analysis)
+  - [Tree Visualization](#tree-visualization)
+  - [Output Formats](#output-formats)
+  - [Statistics](#statistics)
+- [SQL Queries](#-sql-queries)
+  - [Basic Queries](#basic-queries)
+  - [QueryEngine (Multi-Table)](#queryengine-multi-table)
+  - [Nested Fields & Arrays](#nested-fields--arrays)
+- [LLM Integration](#-llm-integration)
+- [Configuration](#%EF%B8%8F-configuration)
+- [Input Sources](#-input-sources)
+- [Performance](#-performance)
+- [API Reference](#-api-reference)
+- [Development](#-development)
+
+---
+
+## 🚀 Quick Start
+
+```python
+from jsonflux import JsonFlux
+
+# Your JSON data
+data = {
+    "users": [
+        {"id": 1, "name": "Alice", "score": 95.5, "active": True},
+        {"id": 2, "name": "Bob", "score": 87.0, "active": False},
+    ],
+    "metadata": {"version": "1.0", "count": 2}
+}
+
+# Analyze structure
+flux = JsonFlux().analyze(data)
+
+# Visualize as tree
+print(flux.tree())
+
+# Get compact schema (great for LLMs)
+print(flux.tree(format="schema"))
+
+# Query with SQL
+results = flux.query("SELECT unnest(users) as u FROM data WHERE u.score > 90")
+```
+
+Use as a context manager to ensure resources are released automatically:
+
+```python
+with JsonFlux() as flux:
+    flux.analyze(data)
+    print(flux.tree())
+    results = flux.query("SELECT * FROM data LIMIT 10")
+# DuckDB connection is automatically closed
+```
+
+---
+
+## 📦 Installation
+
+### Using pip
+
+```bash
+pip install jsonflux
+```
+
+### Using uv (recommended)
+
+```bash
+uv add jsonflux
+```
+
+### Dependencies
+
+JSONFlux uses high-performance libraries under the hood:
+
+| Library | Purpose |
+|---------|---------|
+| **msgspec** | Ultra-fast JSON parsing |
+| **DuckDB** | In-process analytical SQL engine |
+| **PyArrow** | Zero-copy data transfer |
+| **tabulate** | Beautiful table formatting |
+
+---
+
+## 🔍 Structure Analysis
+
+### Tree Visualization
+
+Analyze JSON and visualize its structure with types and sample values.
+
+```python
+from jsonflux import JsonFlux
+
+data = {
+    "users": [
+        {"id": 1, "name": "Alice", "score": 95.5},
+        {"id": 2, "name": "Bob", "score": 87.0},
+    ],
+    "metadata": {"version": "1.0", "count": 2}
+}
+
+flux = JsonFlux(samples=2).analyze(data)
+print(flux.tree())
+```
+
+**Output:**
+```
+<root>
+├── metadata
+│   ├── count: int samples=[2, 2]
+│   └── version: str samples=["1.0", "1.0"]
+└── users
+    └── object [2]
+        ├── id: int samples=[1, 2]
+        ├── name: str samples=["Alice", "Bob"]
+        └── score: float samples=[95.5, 87.0]
+```
+
+### Output Formats
+
+JSONFlux supports multiple output formats for different use cases:
+
+#### 1. Tree Format (default)
+Box-drawing connectors for visual clarity.
+
+```python
+flux.tree(format="tree")
+```
+
+```
+<root>
+├── users
+│   └── object [2]
+│       ├── id: int
+│       └── name: str
+└── metadata
+    └── version: str
+```
+
+#### 2. Tabs Format
+Tab-indented output, great for TSV export.
+
+```python
+flux.tree(format="tabs")
+```
+
+```
+<root>
+	metadata
+		count: int
+		version: str
+	users
+		object [2]
+			id: int
+			name: str
+```
+
+#### 3. Bracket Format
+Curly brace nesting, JSON-like structure.
+
+```python
+flux.tree(format="bracket")
+```
+
+```
+<root> {
+	metadata {
+		count: int
+		version: str
+	}
+	users {
+		object [2] {
+			id: int
+			name: str
+		}
+	}
+}
+```
+
+#### 4. Schema Format (LLM-Optimized)
+Compact TypeScript-like schema, ~3x fewer tokens than tree output.
+
+```python
+flux = JsonFlux(samples=0).analyze(data)
+print(flux.tree(format="schema"))
+```
+
+```typescript
+{
+  metadata: {count: int, version: str}
+  users: [{id: int, name: str, score: float}]
+}
+```
+
+**Why use schema format?**
+- **Token-efficient** — Saves tokens when sending to LLMs
+- **Native Types** — TypeScript-inspired syntax familiar to LLMs
+- **Clear Nesting** — Preserves structure for query generation
+- **Nullable Markers** — `score: float?` indicates optional fields
+
+### Statistics
+
+Get comprehensive statistics about your JSON data.
+
+```python
+flux = JsonFlux().analyze(data)
+
+# Full statistics with per-path breakdown
+print(flux.stats())
+
+# Compact summary
+print(flux.stats(compact=True))
+```
+
+**Full stats output:**
+```
+======================================================================
+JSON STATISTICS
+======================================================================
+Total values:     15
+  Objects:        4
+  Arrays:         1
+  Primitives:     10
+Estimated size:   245 B
+Max depth:        3
+Unique paths:     8
+Collection time:  0.001s
+----------------------------------------------------------------------
+
+📍 $.users[].name
+   Count: 2  |  Size: 15 B
+   Types: str:2(100.0%)
+   String: len=3..5, avg=4.0
+   Unique(2): ['Alice', 'Bob']
+
+📍 $.users[].score
+   Count: 2  |  Size: 9 B
+   Types: float:2(100.0%)
+   Numeric: min=87.0, max=95.5, avg=91.25
+```
+
+**Compact stats output:**
+```
+============================================================
+JSON STATISTICS (COMPACT)
+============================================================
+Total values:       15
+  Objects:          4 (26.7%)
+  Arrays:           1 (6.7%)
+  Primitives:       10 (66.7%)
+
+TYPE DISTRIBUTION:
+  str                   4  ( 26.7%)
+  int                   3  ( 20.0%)
+  float                 2  ( 13.3%)
+
+SIZE:
+  Estimated total:  245 B
+  Avg per value:    16 B
+
+STRUCTURE:
+  Max depth:        3
+  Unique paths:     8
+============================================================
+```
+
+#### Programmatic Access to Stats
+
+```python
+stats = flux.stats_result()
+
+print(f"Total values: {stats.total_values}")
+print(f"Max depth: {stats.max_depth}")
+print(f"Size: {stats.total_size_bytes} bytes")
+
+# Access per-field statistics
+for path, field_stats in stats.field_stats.items():
+    print(f"{path}: {field_stats.total_seen} values")
+```
+
+---
+
+## 🔎 SQL Queries
+
+### Basic Queries
+
+Query analyzed data directly with SQL.
+
+```python
+from jsonflux import JsonFlux
+
+data = {
+    "products": [
+        {"id": 1, "name": "Laptop", "price": 999.99, "category": "Electronics"},
+        {"id": 2, "name": "Book", "price": 29.99, "category": "Books"},
+        {"id": 3, "name": "Phone", "price": 699.99, "category": "Electronics"},
+    ]
+}
+
+flux = JsonFlux().analyze(data)
+
+# Query returns list of dicts
+results = flux.query("""
+    SELECT * FROM unnest(data.products) 
+    WHERE price > 100
+    ORDER BY price DESC
+""")
+print(results)
+# [{'id': 1, 'name': 'Laptop', 'price': 999.99, 'category': 'Electronics'}, ...]
+```
+
+### Formatted Output
+
+Get beautiful tabular output with `query_table()`:
+
+```python
+# Grid format (default)
+print(flux.query_table("""
+    SELECT name, price, category
+    FROM unnest(data.products)
+    ORDER BY price DESC
+""", format="grid"))
+```
+
+```
++--------+---------+-------------+
+| name   |   price | category    |
++========+=========+=============+
+| Laptop |  999.99 | Electronics |
++--------+---------+-------------+
+| Phone  |  699.99 | Electronics |
++--------+---------+-------------+
+| Book   |   29.99 | Books       |
++--------+---------+-------------+
+```
+
+**Available formats:**
+- `grid` — ASCII table with borders
+- `simple` — Minimal formatting
+- `markdown` — GitHub-flavored markdown
+- `csv` — Comma-separated values
+- `json` — JSON array
+
+```python
+# Markdown format
+print(flux.query_table(sql, format="markdown"))
+
+# CSV format
+print(flux.query_table(sql, format="csv"))
+
+# JSON format
+print(flux.query_table(sql, format="json"))
+```
+
+### QueryEngine (Multi-Table)
+
+For querying multiple JSON sources with JOINs:
+
+```python
+from jsonflux import QueryEngine
+
+# Sample data
+products = [
+    {"id": "P1", "name": "Laptop", "price": 999.99},
+    {"id": "P2", "name": "Phone", "price": 699.99},
+    {"id": "P3", "name": "Monitor", "price": 299.99},
+]
+
+orders = [
+    {"order_id": 101, "product_id": "P1", "customer": "Alice", "qty": 1},
+    {"order_id": 102, "product_id": "P2", "customer": "Bob", "qty": 2},
+    {"order_id": 103, "product_id": "P1", "customer": "Charlie", "qty": 1},
+]
+
+customers = [
+    {"id": "Alice", "country": "USA"},
+    {"id": "Bob", "country": "UK"},
+    {"id": "Charlie", "country": "USA"},
+]
+
+# Register all tables
+engine = QueryEngine()
+engine.register("products", products)
+engine.register("orders", orders)
+engine.register("customers", customers)
+
+# Query with JOINs
+results = engine.query("""
+    SELECT 
+        c.country,
+        p.name as product,
+        SUM(o.qty) as total_qty,
+        SUM(o.qty * p.price) as total_revenue
+    FROM orders o
+    JOIN products p ON o.product_id = p.id
+    JOIN customers c ON o.customer = c.id
+    GROUP BY c.country, p.name
+    ORDER BY total_revenue DESC
+""")
+
+print(results)
+```
+
+#### Context Manager
+
+Use `with` to ensure resources are released:
+
+```python
+with QueryEngine() as engine:
+    engine.register("products", products)
+    engine.register("orders", orders)
+    results = engine.query("SELECT * FROM products LIMIT 5")
+# DuckDB connection is automatically closed
+```
+
+#### Chained Registration
+
+```python
+engine = (
+    QueryEngine()
+    .register("products", products)
+    .register("orders", orders)
+    .register("customers", customers)
+)
+```
+
+#### Register Multiple Tables
+
+```python
+engine = QueryEngine()
+engine.register_many({
+    "products": products,
+    "orders": orders,
+    "customers": customers,
+})
+```
+
+#### Loading from Files
+
+```python
+engine = QueryEngine()
+
+# From file path
+engine.register("products", "data/products.json")
+
+# With JSON path extraction
+engine.register("items", "api_response.json", path="$.data.items")
+
+# Using register_many with paths
+engine.register_many({
+    "products": ("catalog.json", "$.catalog.products"),
+    "orders": "orders.json",  # No path, use root
+})
+```
+
+### Nested Fields & Arrays
+
+#### Dot Notation for Nested Fields
+
+```python
+products = [
+    {"id": "P1", "name": "Laptop", "specs": {"cpu": "i7", "ram": "16GB"}},
+    {"id": "P2", "name": "Phone", "specs": {"cpu": "M3", "ram": "8GB"}},
+]
+
+engine = QueryEngine().register("products", products)
+
+# Access nested fields with dot notation
+results = engine.query("""
+    SELECT name, specs.cpu, specs.ram
+    FROM products
+    WHERE specs.ram = '16GB'
+""")
+```
+
+#### Unnesting Arrays
+
+```python
+orders = [
+    {"order_id": 101, "customer": "Alice", "items": [
+        {"product": "Laptop", "qty": 1},
+        {"product": "Mouse", "qty": 2}
+    ]},
+    {"order_id": 102, "customer": "Bob", "items": [
+        {"product": "Phone", "qty": 1}
+    ]},
+]
+
+engine = QueryEngine().register("orders", orders)
+
+# Flatten array and query
+results = engine.query("""
+    SELECT 
+        customer,
+        item.product,
+        item.qty
+    FROM (
+        SELECT customer, unnest(items) as item
+        FROM orders
+    )
+    WHERE item.qty > 1
+""")
+```
+
+#### Array Functions
+
+```python
+products = [
+    {"name": "Laptop", "colors": ["silver", "space gray"]},
+    {"name": "Phone", "colors": ["black", "white", "blue"]},
+]
+
+engine = QueryEngine().register("products", products)
+
+# Check if array contains value
+results = engine.query("""
+    SELECT name
+    FROM products
+    WHERE list_contains(colors, 'silver')
+""")
+
+# Get array length
+results = engine.query("""
+    SELECT name, len(colors) as num_colors
+    FROM products
+""")
+```
+
+### Query Utilities
+
+#### View Table Information
+
+```python
+engine.print_tables()
+```
+
+```
+Registered tables:
+  products:
+    source: memory
+    rows: 3
+  orders:
+    source: memory
+    rows: 3
+```
+
+#### View Table Schema
+
+```python
+engine.print_schema("products")
+```
+
+```
+Schema of 'products':
+  id: VARCHAR
+  name: VARCHAR
+  price: DOUBLE
+```
+
+#### Explain Query Plan
+
+```python
+print(engine.explain("""
+    SELECT * FROM products WHERE price > 100
+"""))
+```
+
+---
+
+## 🤖 LLM Integration
+
+JSONFlux is designed with LLM workflows in mind, providing ready-to-use system prompts for SQL generation.
+
+### Quick Start: One-Shot SQL Generation
+
+The fastest way to use JSONFlux with an LLM:
+
+```python
+from jsonflux import QueryEngine
+from pydantic_ai import Agent
+
+# 1. Register your data
+engine = QueryEngine()
+engine.register("orders", orders_data)
+engine.register("products", products_data)
+
+# 2. Create agent with built-in system prompt
+agent = Agent("openai:gpt-4o", system_prompt=engine.generate_prompt())
+
+# 3. Ask questions, get SQL, execute
+async def query(question: str) -> str:
+    result = await agent.run(question)
+    return engine.format_query(result.data, format="markdown")
+
+# Usage
+print(await query("What are total sales by product category?"))
+```
+
+### Built-in System Prompt
+
+`engine.generate_prompt()` returns a comprehensive prompt that includes:
+
+- **Schema interpretation** — How to read the TypeScript-like notation
+- **Query patterns** — 6 patterns from simple to complex JOINs
+- **UNNEST examples** — Critical for array handling (the #1 mistake LLMs make)
+- **DuckDB functions** — Common functions the LLM can use
+- **Common mistakes** — What to avoid
+- **Your table schemas** — Automatically appended
+
+```python
+# Get the complete system prompt
+print(engine.generate_prompt())
+```
+
+**Example output:**
+```
+You are a SQL query generator for JSON data...
+
+## How This Works
+...
+
+## Query Patterns
+
+### Pattern 3: Arrays (UNNEST) — CRITICAL
+**Arrays MUST be flattened with UNNEST before grouping/aggregation.**
+...
+
+---
+
+# YOUR DATA
+
+## Available Tables
+
+### orders (150 rows)
+
+{order_id: int, customer: str, items: [{product: str, qty: int, price: float}]}
+
+...
+```
+
+### Using with Different LLM Libraries
+
+#### pydantic-ai
+
+```python
+from pydantic_ai import Agent
+from jsonflux import QueryEngine
+
+engine = QueryEngine().register("data", my_json)
+
+agent = Agent("openai:gpt-4o", system_prompt=engine.generate_prompt())
+result = await agent.run("Show top 5 customers by total spend")
+print(engine.format_query(result.data, format="grid"))
+```
+
+#### OpenAI SDK
+
+```python
+from openai import OpenAI
+from jsonflux import QueryEngine
+
+client = OpenAI()
+engine = QueryEngine().register("data", my_json)
+
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[
+        {"role": "system", "content": engine.generate_prompt()},
+        {"role": "user", "content": "What are total sales by region?"}
+    ]
+)
+sql = response.choices[0].message.content
+print(engine.format_query(sql, format="markdown"))
+```
+
+#### Anthropic SDK
+
+```python
+from anthropic import Anthropic
+from jsonflux import QueryEngine
+
+client = Anthropic()
+engine = QueryEngine().register("data", my_json)
+
+response = client.messages.create(
+    model="claude-sonnet-4-20250514",
+    max_tokens=1024,
+    system=engine.generate_prompt(),
+    messages=[{"role": "user", "content": "Show monthly revenue trends"}]
+)
+sql = response.content[0].text
+print(engine.format_query(sql, format="markdown"))
+```
+
+### Custom System Prompts
+
+If you want to customize the prompt, you can use the schema context separately:
+
+```python
+from jsonflux import QueryEngine
+
+engine = QueryEngine().register("data", my_json)
+
+# Use just the schema context (for your own prompt)
+schema_only = engine.describe_tables()
+
+# Combine with your own instructions
+custom_prompt = f"""
+You are a SQL query generator.
+
+ADDITIONAL INSTRUCTIONS:
+- Always limit results to 100 rows
+- Use snake_case for column aliases
+
+{engine.describe_tables()}
+"""
+```
+
+### Schema Context Only
+
+Use `describe_tables()` for just the schema (minimal tokens):
+
+```python
+context = engine.describe_tables()
+print(context)
+```
+
+**Output:**
+```markdown
+## Available Tables
+
+### products (3 rows)
+
+```typescript
+{
+  id: str
+  name: str
+  price: float
+  category: str
+}
+```
+
+### orders (3 rows)
+
+```typescript
+{
+  order_id: int
+  product_id: str
+  customer: str
+  qty: int
+}
+```
+
+## SQL Notes
+
+- Use standard SQL syntax (DuckDB)
+- Access nested objects with dot notation: `table.nested.field`
+- **Arrays require UNNEST for grouping/aggregation:**
+  ```sql
+  SELECT item.field, SUM(item.qty)
+  FROM (SELECT unnest(array_column) as item FROM table)
+  GROUP BY item.field
+  ```
+- JOINs, CTEs, and window functions are supported
+```
+
+### Natural Language to SQL Workflow
+
+```python
+from jsonflux import QueryEngine
+
+# 1. Set up your data
+engine = QueryEngine()
+engine.register("products", products_data)
+engine.register("orders", orders_data)
+engine.register("customers", customers_data)
+
+# 2. Generate context for LLM
+context = engine.describe_tables()
+
+# 3. Send to LLM with user question
+prompt = f"""
+Given these tables:
+
+{context}
+
+User question: "What are total sales by country?"
+
+Generate a SQL query to answer this question.
+"""
+
+# 4. LLM generates SQL (example output)
+sql = """
+SELECT 
+    c.country,
+    SUM(o.qty * p.price) as total_sales
+FROM customers c
+JOIN orders o ON c.id = o.customer
+JOIN products p ON o.product_id = p.id
+GROUP BY c.country
+ORDER BY total_sales DESC
+"""
+
+# 5. Execute and format results
+print(engine.format_query(sql, format="markdown"))
+```
+
+### Schema with Samples
+
+Include sample values to help LLMs understand data patterns:
+
+```python
+flux = JsonFlux(samples=3).analyze(data)
+print(flux.tree(format="schema"))
+```
+
+```typescript
+{
+  users: [{
+    id: int samples=[1, 2, 3]
+    name: str samples=["Alice", "Bob", "Charlie"]
+    score: float samples=[95.5, 87.0, 92.3]
+  }]
+}
+```
+
+### SQL Query Patterns for LLMs
+
+When generating SQL queries, LLMs should use these patterns:
+
+#### Pattern 1: Flat Data with Dot Notation
+
+For nested objects, use dot notation directly:
+
+```sql
+-- Schema: {user: {name: str, address: {city: str, country: str}}}
+SELECT 
+    user.name,
+    user.address.city,
+    user.address.country
+FROM data
+WHERE user.address.country = 'USA'
+```
+
+#### Pattern 2: UNNEST for Array Aggregation
+
+**This is the key pattern for grouping/aggregating array data.**
+
+When data has arrays that need to be grouped or aggregated, use `UNNEST` in a subquery:
+
+```sql
+-- Schema: {orders: [{customer: str, items: [{product: str, qty: int, price: float}]}]}
+
+-- Step 1: Unnest orders array
+-- Step 2: Unnest items array within each order  
+-- Step 3: Group and aggregate
+
+SELECT 
+    o.customer,
+    i.product,
+    SUM(i.qty) as total_qty,
+    SUM(i.qty * i.price) as total_spent
+FROM (
+    SELECT unnest(orders) as o
+    FROM data
+) orders_flat,
+LATERAL (
+    SELECT unnest(o.items) as i
+) items_flat
+GROUP BY o.customer, i.product
+ORDER BY total_spent DESC
+```
+
+#### Pattern 3: Simple Array Flattening
+
+For a single array level:
+
+```sql
+-- Schema: {products: [{name: str, price: float, category: str}]}
+
+SELECT 
+    p.category,
+    COUNT(*) as count,
+    AVG(p.price) as avg_price
+FROM (
+    SELECT unnest(products) as p
+    FROM data
+)
+GROUP BY p.category
+```
+
+#### Pattern 4: Multi-Table JOINs with Arrays
+
+When joining tables that have arrays:
+
+```sql
+-- products: [{id: str, name: str, price: float}]
+-- orders: [{order_id: int, items: [{product_id: str, qty: int}]}]
+
+SELECT 
+    p.name,
+    SUM(item.qty) as total_sold,
+    SUM(item.qty * p.price) as revenue
+FROM products p
+JOIN (
+    SELECT unnest(items) as item
+    FROM orders
+) o ON o.item.product_id = p.id
+GROUP BY p.name
+ORDER BY revenue DESC
+```
+
+#### Pattern 5: Filtering Before and After UNNEST
+
+```sql
+-- Filter parent rows BEFORE unnest (more efficient)
+SELECT i.product, i.qty
+FROM (
+    SELECT unnest(items) as i
+    FROM orders
+    WHERE customer = 'Alice'  -- Filter before unnest
+)
+WHERE i.qty > 1  -- Filter after unnest
+```
+
+#### UNNEST Quick Reference
+
+| Goal | SQL Pattern |
+|------|-------------|
+| Flatten array | `SELECT unnest(arr) as item FROM table` |
+| Access flattened fields | `SELECT item.field FROM (SELECT unnest(arr) as item FROM table)` |
+| Count items | `SELECT COUNT(*) FROM (SELECT unnest(arr) FROM table)` |
+| Group by array field | `SELECT item.category, COUNT(*) FROM (SELECT unnest(arr) as item FROM table) GROUP BY item.category` |
+| Nested arrays | Use `LATERAL` with multiple unnests |
+
+---
+
+## ⚙️ Configuration
+
+### JsonFlux Options
+
+```python
+flux = JsonFlux(
+    max_depth=32,           # Max nesting depth to analyze
+    sample_per_kind=200,    # Max samples per type in arrays
+    sort_keys=True,         # Sort object keys alphabetically
+    max_keys_per_object=None,  # Limit keys shown (None = all)
+    samples=3,              # Number of sample values to collect
+    sample_seed=12345,      # Seed for reproducible sampling
+    max_sample_len=60,      # Max length for sample strings
+)
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `max_depth` | 32 | Maximum nesting depth to traverse |
+| `sample_per_kind` | 200 | Max samples per type when analyzing arrays |
+| `sort_keys` | True | Sort object keys alphabetically in output |
+| `max_keys_per_object` | None | Limit number of keys shown per object |
+| `samples` | 3 | Number of sample values to collect (0 to disable) |
+| `sample_seed` | 12345 | Random seed for reproducible sampling |
+| `max_sample_len` | 60 | Maximum character length for string samples |
+
+### QueryEngine Options
+
+```python
+# Format query options
+engine.format_query(
+    sql,
+    format="grid",        # Output format
+    max_rows=20,          # Limit rows (None = all)
+    max_colwidth=50,      # Max column width (None = unlimited)
+)
+```
+
+---
+
+## 📁 Input Sources
+
+JSONFlux accepts multiple input types:
+
+```python
+from pathlib import Path
+from jsonflux import JsonFlux
+
+flux = JsonFlux()
+
+# Dict
+flux.analyze({"key": "value"})
+
+# List
+flux.analyze([{"id": 1}, {"id": 2}])
+
+# JSON string
+flux.analyze('{"key": "value"}')
+
+# File path (string)
+flux.analyze("data.json")
+
+# File path (Path object)
+flux.analyze(Path("data.json"))
+
+# List of JSON strings (batch processing)
+flux.analyze(['{"id": 1}', '{"id": 2}', '{"id": 3}'])
+```
+
+---
+
+## ⚡ Performance
+
+JSONFlux is optimized for speed:
+
+| Optimization | Description |
+|--------------|-------------|
+| **msgspec** | 2-10x faster JSON parsing than stdlib |
+| **DuckDB** | Columnar, vectorized SQL execution |
+| **PyArrow** | Zero-copy data transfer between Python and DuckDB |
+| **Iterative algorithms** | Avoids recursion limits on deep structures |
+| **Local variable caching** | Optimized hot paths |
+| **`__slots__`** | Memory-efficient class instances |
+
+### Benchmarks
+
+Typical performance on modern hardware:
+
+| Operation | Records | Time |
+|-----------|---------|------|
+| Parse + analyze | 15,000 | ~200ms |
+| SQL query | 15,000 | ~10ms |
+| Stats collection | 15,000 | ~100ms |
+
+### Timing Information
+
+```python
+flux = JsonFlux().analyze(large_data)
+
+timing = flux.timing()
+print(f"Parse time: {timing['parse_time']:.3f}s")
+print(f"Analyze time: {timing['analyze_time']:.3f}s")
+print(f"Sample time: {timing['sample_time']:.3f}s")
+print(f"Total: {timing['total_time']:.3f}s")
+```
+
+---
+
+## 📡 API Reference
+
+### JsonFlux Class
+
+| Method | Description |
+|--------|-------------|
+| `analyze(source)` | Load and analyze JSON data |
+| `tree(format, indent, root_label)` | Return structure visualization |
+| `stats(compact, top_n, max_unique)` | Return statistics report |
+| `stats_result(max_unique)` | Return raw StatsResult object |
+| `query(sql)` | Execute SQL, return list of dicts |
+| `query_table(sql, format, max_rows, max_colwidth)` | Execute SQL, return formatted string |
+| `timing()` | Return timing information |
+| `profile_result()` | Return raw ProfileResult |
+| `close()` | Close cached query engine and release resources |
+
+### QueryEngine Class
+
+| Method | Description |
+|--------|-------------|
+| `register(name, source, path)` | Register a JSON source as table |
+| `register_many(tables)` | Register multiple tables at once |
+| `query(sql)` | Execute SQL, return list of dicts |
+| `query_arrow(sql)` | Execute SQL, return PyArrow Table |
+| `execute(sql)` | Execute SQL, return raw DuckDB result |
+| `execute_query(sql, split, max_colwidth)` | Execute SQL, return structured QueryResult |
+| `format_query(sql, format, max_rows, max_colwidth)` | Execute SQL, return formatted string |
+| `generate_prompt(samples)` | Generate complete LLM system prompt |
+| `describe_tables(samples)` | Generate LLM-friendly schema context |
+| `explain(sql)` | Show query execution plan |
+| `tables_info()` | Show registered tables info |
+| `schema(table)` | Show schema of a table |
+| `close()` | Close DuckDB connection and release resources |
+
+### Output Formats
+
+| Format | `tree()` | `format_query()` | Description |
+|--------|----------|------------------|-------------|
+| `tree` | ✅ | | Box-drawing connectors |
+| `tabs` | ✅ | | Tab-indented |
+| `bracket` | ✅ | | Curly brace nesting |
+| `schema` | ✅ | | Compact TypeScript-like |
+| `grid` | | ✅ | ASCII table with borders |
+| `simple` | | ✅ | Minimal formatting |
+| `pipe` | | ✅ | Pipe-delimited table |
+| `markdown` | | ✅ | GitHub-flavored markdown |
+| `csv` | | ✅ | Comma-separated values |
+| `json` | | ✅ | JSON array |
+
+---
+
+## 🛠️ Development
+
+### Setup
+
+```bash
+git clone https://github.com/ikaric/jsonflux.git
+cd jsonflux
+
+# Install with dev dependencies
+uv sync --extra dev
+
+# Or with pip
+pip install -e ".[dev]"
+```
+
+### Testing
+
+The test suite contains **100 tests** covering SQL fundamentals, complex JOINs, nested field queries, UNNEST operations, error handling, resource management, and auto-generated LLM system prompt validation. All tests run against a deterministic generated dataset (seed=42) with 15k+ orders and deeply nested structures.
+
+See **[TESTS.md](TESTS.md)** for the full test catalog with descriptions and assertions.
+
+```bash
+# Run all 100 tests
+uv run pytest tests/test_jsonflux.py -v
+
+# Run tests with coverage
+uv run pytest --cov=jsonflux
+
+# Run specific category
+uv run pytest tests/test_jsonflux.py -v -k "prompt"   # LLM prompt tests
+uv run pytest tests/test_jsonflux.py -v -k "join"      # JOIN tests
+uv run pytest tests/test_jsonflux.py -v -k "unnest"    # UNNEST tests
+```
+
+### Linting
+
+```bash
+# Check code
+uv run ruff check src/
+
+# Format code
+uv run ruff format src/
+```
+
+### Validation
+
+JSONFlux includes a built-in validation function:
+
+```python
+from jsonflux import validate
+
+# Returns empty list on success, or list of error strings
+errors = validate()
+if errors:
+    print("Validation failed:", errors)
+```
+
+---
+
+## 🛠️ Tech Stack
+
+<table>
+<tr>
+<td align="center" width="120">
+<img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/python/python-original.svg" width="48" height="48" alt="Python" />
+<br><strong>Python 3.9+</strong>
+<br><sub>Core language</sub>
+</td>
+<td align="center" width="120">
+<img src="https://duckdb.org/images/logo-dl/DuckDB_Logo.png" width="48" height="48" alt="DuckDB" />
+<br><strong>DuckDB</strong>
+<br><sub>SQL engine</sub>
+</td>
+<td align="center" width="120">
+<img src="https://arrow.apache.org/img/arrow-logo_hex_black-txt_white-bg.png" width="48" height="48" alt="Arrow" />
+<br><strong>PyArrow</strong>
+<br><sub>Data transfer</sub>
+</td>
+</tr>
+</table>
+
+---
+
+## 📄 License
+
+This project is licensed under the **MIT License**.
+
+---
+
+<div align="center">
+
+**[⬆ Back to Top](#-jsonflux)**
+
+Made with ❤️ for the Python community
+
+</div>
