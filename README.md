@@ -26,6 +26,8 @@
 
 | Feature | Description |
 |---------|-------------|
+| 🔒 **Sandboxed by Default** | SQL runs in a locked-down DuckDB — no filesystem, network, or extensions |
+| 🎯 **Lossless Ingestion** | Every row and field is scanned; no dropped keys, no truncated values |
 | 🔍 **Structure Analysis** | Analyze JSON to reveal types, nesting, and patterns |
 | 🌳 **Tree Visualization** | Multiple formats: tree, tabs, bracket, and compact schema |
 | 📊 **Statistics** | Comprehensive stats: counts, sizes, distributions, nulls |
@@ -39,6 +41,8 @@
 ## 📑 Table of Contents
 
 - [Quick Start](#-quick-start)
+- [Security & Sandboxing](#-security--sandboxing)
+- [Lossless Ingestion](#-lossless-ingestion)
 - [Installation](#-installation)
 - [Structure Analysis](#-structure-analysis)
   - [Tree Visualization](#tree-visualization)
@@ -93,6 +97,123 @@ with JsonFlux() as flux:
     results = flux.query("SELECT * FROM data LIMIT 10")
 # DuckDB connection is automatically closed
 ```
+
+---
+
+## 🔒 Security & Sandboxing
+
+JSONFlux exists so an LLM can answer data questions by **writing SQL instead of
+being handed a shell** with `curl`/`jq`/filesystem access. That only reduces
+risk if the SQL engine itself cannot reach outside the data you gave it — so by
+default it can't.
+
+Out of the box, DuckDB can read your filesystem, write files, reach the network,
+and load extensions directly from SQL:
+
+```sql
+-- All of this works in a *default* DuckDB connection:
+SELECT content FROM read_text('/etc/passwd');       -- exfiltrate files
+COPY (SELECT ...) TO '/tmp/out' (FORMAT csv);        -- write files
+INSTALL httpfs; SELECT * FROM read_csv('https://…'); -- reach the network
+ATTACH '/some/other.db';                             -- open other databases
+```
+
+A prompt-injected model — or a malicious value inside the very JSON being
+analyzed — could emit any of these. **JSONFlux blocks them all by default.**
+Every `QueryEngine` (and every `JsonFlux.query()`) runs on a DuckDB connection
+that is locked down at creation time:
+
+| Protection | Effect |
+|-----------|--------|
+| `enable_external_access=false` | `read_csv`/`read_text`/`COPY`/`ATTACH`/`glob` over any local or remote path fail |
+| Extensions disabled | No `INSTALL`/`LOAD`, no autoload, no community extensions (blocks `httpfs` network access) |
+| `lock_configuration=true` | The settings above **cannot** be re-enabled by a later `SET`/`PRAGMA` |
+| `memory_limit` (default `2GB`) | Bounds runaway aggregations / cross joins |
+| `query_timeout` (default `30s`) | A pathological query is interrupted, not run to completion |
+| Table-name validation | Registered names must be plain SQL identifiers (no injection) |
+
+```python
+from jsonflux import QueryEngine
+
+engine = QueryEngine().register("data", my_json)  # sandboxed by default
+
+engine.query("SELECT content FROM read_text('/etc/passwd')")
+# duckdb.PermissionException: file system operations are disabled
+
+engine.query("INSTALL httpfs")
+# duckdb.PermissionException: extension installation is disabled
+
+engine.query("SELECT category, SUM(price) FROM data GROUP BY category")  # ✅ works
+```
+
+### Tuning the policy
+
+Everything is configurable via `SecurityConfig`. The defaults are the safe
+choice; loosen only what you need and trust.
+
+```python
+from jsonflux import QueryEngine, SecurityConfig
+
+# Convenience overrides
+engine = QueryEngine(
+    memory_limit="512MB",
+    query_timeout=10.0,
+)
+
+# Full control
+engine = QueryEngine(security=SecurityConfig(
+    allow_external_access=False,  # keep the filesystem/network locked (default)
+    allow_extensions=False,       # keep extensions disabled (default)
+    memory_limit="1GB",
+    threads=4,
+    query_timeout=15.0,
+    lock_configuration=True,      # freeze all of the above (default)
+))
+
+# Opt in to filesystem access ONLY if you trust whoever writes the SQL:
+trusted = QueryEngine(allow_external_access=True)
+```
+
+`JsonFlux` accepts the same policy: `JsonFlux(security=SecurityConfig(...))`.
+
+> **Why this matters for small models.** The whole point of JSONFlux is that a
+> small model like Haiku can safely drive complex aggregations on your behalf.
+> The sandbox is what makes "safely" true — even if the model is wrong or
+> adversarial, the blast radius is the JSON you registered and nothing else.
+
+---
+
+## 🎯 Lossless Ingestion
+
+Real-world API JSON is messy: fields appear only in some records, a value is an
+`int` on most rows and a `float` on one, IDs overflow 64 bits, a field is
+sometimes an object and sometimes a scalar. If ingestion silently drops or
+truncates any of that, an aggregation over it is quietly **wrong** — the worst
+kind of bug for a data tool.
+
+JSONFlux scans **every row and every field** to build the queryable table, and
+resolves conflicts predictably instead of crashing or corrupting:
+
+| Input across rows | Result column | Guarantee |
+|-------------------|---------------|-----------|
+| `int` + `float` | `DOUBLE` | widened, never truncated (`3.7` stays `3.7`) |
+| Key first seen on row 10,000 | its own column | never dropped |
+| `int` beyond 64-bit | `VARCHAR` | preserved **exactly**, no overflow |
+| `int` + `str` (genuine conflict) | `VARCHAR` | both values kept as text |
+| object ⟷ scalar / array | `VARCHAR` (JSON) | kept as JSON text, still queryable |
+| Root array of primitives | `value` column | `SELECT value FROM t` |
+| Empty `[]` / `{}` | valid empty table / string | no crash |
+
+```python
+# A float that appears only after thousands of int rows is NOT truncated:
+engine = QueryEngine().register("t",
+    [{"id": i, "v": i} for i in range(10_000)] + [{"id": 10_000, "v": 3.7}])
+engine.query("SELECT v FROM t WHERE id = 10000")   # -> [{'v': 3.7}]  ✅
+```
+
+This full scan is also **faster** than the old sampled path (~44 ms vs ~180 ms
+for 15k nested records) because clean data skips per-row Python normalization
+entirely.
 
 ---
 
@@ -1062,13 +1183,26 @@ JSONFlux is optimized for speed:
 
 ### Benchmarks
 
-Typical performance on modern hardware:
+Measured on 15,000 nested order records (each with an `items` array and a
+`meta` object), best-of-5, via [`bench/benchmark.py`](bench/benchmark.py):
 
 | Operation | Records | Time |
 |-----------|---------|------|
-| Parse + analyze | 15,000 | ~200ms |
-| SQL query | 15,000 | ~10ms |
-| Stats collection | 15,000 | ~100ms |
+| `register` (decode + lossless Arrow table) | 15,000 | ~44 ms |
+| `GROUP BY` aggregation → dicts | 15,000 | ~2 ms |
+| `UNNEST` + `GROUP BY` (nested arrays) | 15,000 | ~3 ms |
+| Point filter (`WHERE`) | 15,000 | ~1 ms |
+| Schema/prompt generation for the LLM | — | ~0.02 ms |
+| **Sandbox overhead** vs. an unsecured connection | — | **~0 ms** |
+
+Run it yourself:
+
+```bash
+uv run python bench/benchmark.py --rows 50000 --repeat 5
+```
+
+The sandbox is essentially free: locking the connection down is a one-time
+startup cost that does not touch the query hot path.
 
 ### Timing Information
 
@@ -1102,9 +1236,11 @@ print(f"Total: {timing['total_time']:.3f}s")
 
 ### QueryEngine Class
 
+**Constructor:** `QueryEngine(security=None, *, allow_external_access=None, memory_limit=None, query_timeout=None, max_depth=64, sample_scan_limit=1000)` — sandboxed by default; see [Security & Sandboxing](#-security--sandboxing).
+
 | Method | Description |
 |--------|-------------|
-| `register(name, source, path)` | Register a JSON source as table |
+| `register(name, source, path)` | Register a JSON source as table (name must be a plain SQL identifier) |
 | `register_many(tables)` | Register multiple tables at once |
 | `query(sql)` | Execute SQL, return list of dicts |
 | `query_arrow(sql)` | Execute SQL, return PyArrow Table |
@@ -1117,6 +1253,19 @@ print(f"Total: {timing['total_time']:.3f}s")
 | `tables_info()` | Show registered tables info |
 | `schema(table)` | Show schema of a table |
 | `close()` | Close DuckDB connection and release resources |
+
+### SecurityConfig Class
+
+Sandbox and resource policy for the SQL engine. All defaults are the safe choice.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `allow_external_access` | `False` | Allow SQL filesystem/network access (`read_csv`, `COPY`, `ATTACH`, …) |
+| `allow_extensions` | `False` | Allow extension install/load (incl. community extensions) |
+| `memory_limit` | `"2GB"` | DuckDB memory cap (`None` = DuckDB default) |
+| `threads` | `None` | DuckDB worker threads (`None` = DuckDB default) |
+| `query_timeout` | `30.0` | Seconds before a running query is interrupted (`None` = no timeout) |
+| `lock_configuration` | `True` | Freeze the above so `SET`/`PRAGMA` can't loosen them at runtime |
 
 ### Output Formats
 
@@ -1152,21 +1301,30 @@ pip install -e ".[dev]"
 
 ### Testing
 
-The test suite contains **100 tests** covering SQL fundamentals, complex JOINs, nested field queries, UNNEST operations, error handling, resource management, and auto-generated LLM system prompt validation. All tests run against a deterministic generated dataset (seed=42) with 15k+ orders and deeply nested structures.
+The suite contains **206 tests** across four files:
 
-See **[TESTS.md](TESTS.md)** for the full test catalog with descriptions and assertions.
+| File | Tests | Focus |
+|------|-------|-------|
+| `test_jsonflux.py` | 100 | SQL fundamentals, JOINs, nested/UNNEST queries, LLM prompt generation |
+| `test_inference.py` | 39 | Every JSON type combination & conflict — lossless, crash-free ingestion |
+| `test_security.py` | 35 | Sandbox: filesystem/network/extension blocking, timeout, memory, injection |
+| `test_performance.py` | 32 | Caching, iterative merge, streaming, regression guards |
+
+`test_jsonflux.py` runs against a deterministic generated dataset (seed=42) with
+15k+ orders and deeply nested structures. See **[TEST_CATALOG.md](TEST_CATALOG.md)**
+for the annotated catalog.
 
 ```bash
-# Run all 100 tests
-uv run pytest tests/test_jsonflux.py -v
+# Run everything
+uv run pytest
 
-# Run tests with coverage
-uv run pytest --cov=jsonflux
+# With coverage
+uv run pytest --cov=jsonflux --cov-report=term-missing
 
-# Run specific category
-uv run pytest tests/test_jsonflux.py -v -k "prompt"   # LLM prompt tests
-uv run pytest tests/test_jsonflux.py -v -k "join"      # JOIN tests
-uv run pytest tests/test_jsonflux.py -v -k "unnest"    # UNNEST tests
+# Focused runs
+uv run pytest tests/test_security.py -v    # sandbox guarantees
+uv run pytest tests/test_inference.py -v   # type-combination matrix
+uv run pytest -k "join or unnest" -v       # JOIN / UNNEST behaviour
 ```
 
 ### Linting

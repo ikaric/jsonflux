@@ -22,7 +22,6 @@ import pytest
 
 from jsonflux import JsonFlux, QueryEngine
 from jsonflux.core.analyzer import merge_summary
-from jsonflux.core.converter import normalize_data
 from jsonflux.core.models import ArraySummary, Summary
 
 # ---------------------------------------------------------------------------
@@ -86,31 +85,36 @@ class TestStatsCaching:
 
 
 # =========================================================================
-# 2. Converter msgspec fix
+# 2. Conflict columns are JSON-encoded via msgspec
 # =========================================================================
 
 
-class TestConverterMsgspec:
-    def test_normalize_data_serializes_dicts(self):
-        """Dicts should be serialized to JSON strings via msgspec, not json."""
-        import pyarrow as pa
+class TestConflictStringification:
+    def test_object_conflict_serialized_to_json(self):
+        """When a column mixes objects and scalars it degrades to a string
+        column whose object values are valid JSON (encoded via msgspec)."""
+        eng = QueryEngine().register(
+            "t", [{"v": {"key": "value", "num": 42}}, {"v": 5}]
+        )
+        try:
+            rows = eng.query("SELECT v FROM t ORDER BY v")
+        finally:
+            eng.close()
+        vals = {r["v"] for r in rows}
+        assert "5" in vals
+        obj_val = next(v for v in vals if v != "5")
+        assert msgspec.json.decode(obj_val) == {"key": "value", "num": 42}
 
-        data = {"key": "value", "num": 42}
-        result = normalize_data(data, pa.string())
-        assert isinstance(result, str)
-        # Verify it's valid JSON by round-tripping through msgspec
-        decoded = msgspec.json.decode(result)
-        assert decoded == data
-
-    def test_normalize_data_serializes_lists(self):
-        """Lists should be serialized to JSON strings via msgspec."""
-        import pyarrow as pa
-
-        data = [1, "two", 3.0]
-        result = normalize_data(data, pa.string())
-        assert isinstance(result, str)
-        decoded = msgspec.json.decode(result)
-        assert decoded == data
+    def test_list_conflict_serialized_to_json(self):
+        eng = QueryEngine().register("t", [{"v": [1, 2, 3]}, {"v": "x"}])
+        try:
+            rows = eng.query("SELECT v FROM t ORDER BY v")
+        finally:
+            eng.close()
+        vals = {r["v"] for r in rows}
+        assert "x" in vals
+        list_val = next(v for v in vals if v != "x")
+        assert msgspec.json.decode(list_val) == [1, 2, 3]
 
 
 # =========================================================================
@@ -121,6 +125,7 @@ class TestConverterMsgspec:
 class TestIterativeMergeSummary:
     def test_merge_deeply_nested_no_overflow(self):
         """merge_summary should handle 200+ levels without stack overflow."""
+
         # Build two deeply nested summaries
         def make_deep(depth: int) -> Summary:
             s = Summary(primitives=frozenset(("int",)))

@@ -38,6 +38,7 @@ from .core.stats import (
     collect_stats as collect_stats_fn,
 )
 from .query.engine import QueryEngine, QueryResult
+from .query.security import SecurityConfig
 from .utils.sampling import ReservoirSampler
 
 # Re-export under original name for public API
@@ -70,6 +71,7 @@ __all__ = [
     "ReservoirSampler",
     "QueryEngine",
     "QueryResult",
+    "SecurityConfig",
     # Utility functions
     "kind_of",
     "fmt_types",
@@ -128,6 +130,7 @@ class JsonFlux:
     __slots__ = (
         "config",
         "analyzer",
+        "security",
         "data",
         "_last_profile",
         "_engine",
@@ -144,7 +147,16 @@ class JsonFlux:
         samples: int = 3,
         sample_seed: int = 12345,
         max_sample_len: int = 60,
+        security: SecurityConfig | None = None,
     ):
+        """
+        Args:
+            security: Sandbox/resource policy for the SQL engine used by
+                :meth:`query`.  When ``None`` a secure default is used
+                (no filesystem/network access, no extensions, locked config,
+                2GB memory limit, 30s query timeout).  See
+                :class:`~jsonflux.SecurityConfig`.
+        """
         self.config = JsonFluxConfig(
             max_depth=max_depth,
             sample_per_kind=sample_per_kind,
@@ -160,6 +172,7 @@ class JsonFlux:
             sort_keys=sort_keys,
             max_keys_per_object=max_keys_per_object,
         )
+        self.security = security
         self.data: Any = None
         self._last_profile: ProfileResult | None = None
         self._engine: QueryEngine | None = None
@@ -263,8 +276,7 @@ class JsonFlux:
                 pass
             # Nothing worked -- give a clear error instead of FileNotFoundError
             raise ValueError(
-                f"Source string is not valid JSON and no file found at "
-                f"path: {source!r}"
+                f"Source string is not valid JSON and no file found at path: {source!r}"
             )
         raise TypeError(f"Unsupported source type: {t}")
 
@@ -357,10 +369,7 @@ class JsonFlux:
         if self.data is None:
             raise ValueError("No data analyzed yet. Call analyze() first.")
         # Return cached result if available and max_unique matches
-        if (
-            self._last_stats is not None
-            and self._last_stats_max_unique == max_unique
-        ):
+        if self._last_stats is not None and self._last_stats_max_unique == max_unique:
             return self._last_stats
         result = collect_stats_fn(self.data, max_unique=max_unique)
         self._last_stats = result
@@ -372,7 +381,9 @@ class JsonFlux:
         if self.data is None:
             raise ValueError("No data analyzed yet. Call analyze() first.")
         if self._engine is None:
-            self._engine = QueryEngine()
+            self._engine = QueryEngine(
+                security=self.security, max_depth=self.config.max_depth
+            )
             self._engine.register("data", self.data)
         return self._engine
 
@@ -380,9 +391,7 @@ class JsonFlux:
         """Query the analyzed data using SQL."""
         return self._get_engine().query(sql)
 
-    def query_iter(
-        self, sql: str, batch_size: int = 1000
-    ) -> Iterator[dict[str, Any]]:
+    def query_iter(self, sql: str, batch_size: int = 1000) -> Iterator[dict[str, Any]]:
         """
         Query the analyzed data and yield results as dicts.
 
@@ -484,10 +493,7 @@ class JsonFlux:
 
     def __repr__(self) -> str:
         if self._last_profile:
-            return (
-                f"JsonFlux(analyzed=True, "
-                f"source={self._last_profile.source!r})"
-            )
+            return f"JsonFlux(analyzed=True, source={self._last_profile.source!r})"
         return "JsonFlux(analyzed=False)"
 
     def __enter__(self) -> JsonFlux:
