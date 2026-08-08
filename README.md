@@ -41,6 +41,51 @@ JSONFlux is the third option. It reads the payload once and hands the model a **
 
 **This is built for small, cheap, local models.** The schema is deliberately flat and explicitly typed because that is what a weak model needs to produce correct SQL — not because a frontier model couldn't infer it. Structure is presented once, plainly, so the model spends its capacity on the query rather than on guessing the shape of your data.
 
+### You don't write the system prompt — `generate_prompt()` does
+
+Register your JSON, and the whole system prompt is generated for you: the DuckDB dialect rules, the schema notation, and worked query patterns **written against your actual registered tables**. The examples name your table and your fields, so the model is copying a working query rather than translating a generic one.
+
+```python
+engine = QueryEngine()
+engine.register("quakes", "feed.json", path="$.features")
+
+system_prompt = engine.generate_prompt()   # ready to send, no hand-writing
+```
+
+Excerpt of what comes out for that table:
+
+````text
+You are a DuckDB SQL query generator. Convert natural language data
+requests into SQL queries.
+
+RULES:
+- Return ONLY the raw SQL query text.
+- No explanations, no markdown fences, no code blocks, no comments.
+
+## Schema Notation
+- `field: str` = string, `int` = integer, `float` = number
+- `field: str?` = nullable (may be null)
+- Nested objects use dot notation: `quakes.properties.tsunami`
+
+## Query Patterns
+
+### Basic Query
+```sql
+SELECT type, id FROM quakes ORDER BY type LIMIT 10
+```
+
+### Nested Objects (Dot Notation)
+```sql
+SELECT properties.tsunami FROM quakes
+```
+
+## DuckDB Functions
+- Aggregation: `SUM()`, `AVG()`, `COUNT()`, `MIN()`, `MAX()`
+...
+````
+
+Note `quakes`, `properties.tsunami`, `type`, `id` — those are read out of the registered data, not placeholders. Small models fail at SQL mostly by inventing column names, guessing at nesting, or reaching for a dialect the engine doesn't speak. Naming all three up front, in the prompt, removes most of that failure surface before the model writes a token.
+
 ### When you *don't* need this
 
 Be honest about the alternative: if you are writing the SQL yourself, or a frontier model is, and you trust the query, then DuckDB already does this in one line:
@@ -58,7 +103,8 @@ JSONFlux earns its place when **the SQL author is small, cheap, or untrusted** �
 | Feature | Description |
 |---------|-------------|
 | 🔒 **Sandboxed by Default** | SQL runs in a locked-down DuckDB — no filesystem, network, extensions, or writes. Safe to point generated queries at. |
-| 🤖 **Built for Small Models** | Flat, explicitly-typed schemas and pre-formatted prompts, so a weak model gets the query right |
+| 📝 **Self-Writing System Prompt** | `generate_prompt()` emits DuckDB dialect rules and query patterns using *your* table and field names — no prompt engineering |
+| 🤖 **Built for Small Models** | Flat, explicitly-typed schemas, so a weak model gets the query right on the first try |
 | 🪶 **Context-Window Friendly** | Megabytes of JSON become a few hundred tokens of schema — the data never enters the prompt |
 | 🎯 **Lossless Ingestion** | Every row and field is scanned; no dropped keys, no truncated values, no sampled guesses |
 | 🔍 **Structure Analysis** | Union types, nullability, nesting, and patterns — what `read_json_auto` won't tell you |
