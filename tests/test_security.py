@@ -527,6 +527,19 @@ def test_read_only_allows_complex_reads(engine, sql):
     engine.query(sql)
 
 
+def test_query_iter_validates_eagerly():
+    """query_iter must reject bad SQL at call time, not on first iteration —
+    a discarded generator would otherwise silently skip the read-only check."""
+    eng = QueryEngine().register("data", SAMPLE)
+    try:
+        with pytest.raises(ReadOnlyViolationError):
+            eng.query_iter("DROP VIEW data")  # note: no iteration
+        with pytest.raises(duckdb.Error):
+            eng.query_iter("SELECT nonexistent_col FROM data")
+    finally:
+        eng.close()
+
+
 def test_read_only_applies_to_all_query_methods():
     eng = QueryEngine().register("data", SAMPLE)
     try:
@@ -539,6 +552,30 @@ def test_read_only_applies_to_all_query_methods():
         # execute_query / format_query surface it as an error result/string.
         assert eng.execute_query("DROP VIEW data").success is False
         assert eng.format_query("DROP VIEW data").startswith("ERROR:")
+    finally:
+        eng.close()
+
+
+def test_explain_cannot_smuggle_writes():
+    """explain() routes through the guarded fetch: multi-statement SQL must
+    not piggyback a write on the EXPLAIN prefix."""
+    eng = QueryEngine().register("data", SAMPLE)
+    try:
+        with pytest.raises(ReadOnlyViolationError):
+            eng.explain("SELECT 1; DROP VIEW data")
+        # Table is intact and still queryable.
+        assert eng.query("SELECT count(*) AS c FROM data")[0]["c"] == 2
+    finally:
+        eng.close()
+
+
+def test_explain_returns_plan_text():
+    eng = QueryEngine().register("data", SAMPLE)
+    try:
+        plan = eng.explain("SELECT * FROM data WHERE id = 1")
+        # The actual rendered plan, not the ("physical_plan", ...) row key.
+        assert "physical_plan" not in plan
+        assert len(plan.splitlines()) > 1
     finally:
         eng.close()
 

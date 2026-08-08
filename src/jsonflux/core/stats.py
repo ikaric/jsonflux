@@ -110,10 +110,14 @@ class FieldStats:
         self.unique_values: set[Any] = set()
         self.unique_limit = unique_limit
 
-    def add(self, value: Any) -> None:
+    def add(self, value: Any, size: int | None = None) -> None:
+        """Fold ``value`` into the stats.  ``size`` lets a caller that already
+        computed ``estimate_json_size(value)`` pass it in instead of paying
+        for it twice per value."""
         self.total_seen += 1
         t = type(value)
-        size = estimate_json_size(value)
+        if size is None:
+            size = estimate_json_size(value)
         self.total_size += size
         if self.size_min is None or size < self.size_min:
             self.size_min = size
@@ -538,7 +542,7 @@ def collect_stats(
             fs = FieldStats(path, unique_limit=max_unique)
             field_stats[path] = fs
 
-        fs.add(v)
+        fs.add(v, size)
         t = type(v)
 
         if t is dict:

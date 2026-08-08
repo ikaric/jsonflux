@@ -199,38 +199,21 @@ class Analyzer:
         # Progress reporting interval (only for the root-level array)
         _PROGRESS_INTERVAL = 100
 
-        def _summarize(v: Any, depth: int) -> Summary:
-            if depth < 0:
-                return Summary(truncated=True)
+        def _summarize_array(
+            v: list,
+            depth: int,
+            progress: Callable[[int, int], None] | None,
+        ) -> Summary:
+            """Shared array summarisation.  ``progress`` is non-None only for
+            the root-level array (separate loop so the common per-element path
+            pays no callback check)."""
+            arr_len = len(v)
+            counts = {kk: 0 for kk in _ALL_KINDS}
+            obj_samples: list[Any] = []
+            arr_samples: list[Any] = []
+            sample_per_kind = self.sample_per_kind
 
-            k = _kind_of(v)
-
-            if k in _PRIMITIVE_KINDS:
-                return Summary(primitives=frozenset((k,)))
-
-            if k == "object":
-                if depth == 0:
-                    return Summary(obj={}, truncated=True)
-                keys = list(v.keys())
-                if self.sort_keys:
-                    keys.sort(key=str)
-                truncated = False
-                if (
-                    self.max_keys_per_object is not None
-                    and len(keys) > self.max_keys_per_object
-                ):
-                    keys = keys[: self.max_keys_per_object]
-                    truncated = True
-                children = {str(key): _summarize(v[key], depth - 1) for key in keys}
-                return Summary(obj=children, truncated=truncated)
-
-            if k == "array":
-                arr_len = len(v)
-                counts = {kk: 0 for kk in _ALL_KINDS}
-                obj_samples: list[Any] = []
-                arr_samples: list[Any] = []
-                sample_per_kind = self.sample_per_kind
-
+            if progress is None:
                 for el in v:
                     ek = _kind_of(el)
                     counts[ek] = counts.get(ek, 0) + 1
@@ -238,64 +221,17 @@ class Analyzer:
                         obj_samples.append(el)
                     elif ek == "array" and len(arr_samples) < sample_per_kind:
                         arr_samples.append(el)
-
-                kind_minmax = {kk: (c, c) for kk, c in counts.items()}
-                if depth == 0:
-                    return Summary(
-                        arr=ArraySummary(
-                            len_min=arr_len,
-                            len_max=arr_len,
-                            kind_minmax=kind_minmax,
-                            truncated=True,
-                        ),
-                        truncated=True,
-                    )
-
-                kind_summaries: dict[str, Summary] = {}
-                if obj_samples:
-                    merged = _summarize(obj_samples[0], depth - 1)
-                    for el in obj_samples[1:]:
-                        merged = _merge_summary(merged, _summarize(el, depth - 1))
-                    kind_summaries["object"] = merged
-                if arr_samples:
-                    merged = _summarize(arr_samples[0], depth - 1)
-                    for el in arr_samples[1:]:
-                        merged = _merge_summary(merged, _summarize(el, depth - 1))
-                    kind_summaries["array"] = merged
-
-                return Summary(
-                    arr=ArraySummary(
-                        len_min=arr_len,
-                        len_max=arr_len,
-                        kind_minmax=kind_minmax,
-                        kind_summaries=kind_summaries,
-                    )
-                )
-
-            return Summary(primitives=frozenset(("unknown",)))
-
-        # If root is a list and progress callback is provided, report progress
-        # while iterating through the top-level array.
-        if progress is not None and type(v) is list:
-            total = len(v)
-            arr_len = total
-            counts = {kk: 0 for kk in _ALL_KINDS}
-            obj_samples: list[Any] = []
-            arr_samples: list[Any] = []
-            sample_per_kind = self.sample_per_kind
-
-            for idx, el in enumerate(v):
-                ek = _kind_of(el)
-                counts[ek] = counts.get(ek, 0) + 1
-                if ek == "object" and len(obj_samples) < sample_per_kind:
-                    obj_samples.append(el)
-                elif ek == "array" and len(arr_samples) < sample_per_kind:
-                    arr_samples.append(el)
-                if idx % _PROGRESS_INTERVAL == 0:
-                    progress(idx, total)
-
-            # Final progress callback
-            progress(total, total)
+            else:
+                for idx, el in enumerate(v):
+                    ek = _kind_of(el)
+                    counts[ek] = counts.get(ek, 0) + 1
+                    if ek == "object" and len(obj_samples) < sample_per_kind:
+                        obj_samples.append(el)
+                    elif ek == "array" and len(arr_samples) < sample_per_kind:
+                        arr_samples.append(el)
+                    if idx % _PROGRESS_INTERVAL == 0:
+                        progress(idx, arr_len)
+                progress(arr_len, arr_len)
 
             kind_minmax = {kk: (c, c) for kk, c in counts.items()}
             if depth == 0:
@@ -330,6 +266,40 @@ class Analyzer:
                 )
             )
 
+        def _summarize(v: Any, depth: int) -> Summary:
+            if depth < 0:
+                return Summary(truncated=True)
+
+            k = _kind_of(v)
+
+            if k in _PRIMITIVE_KINDS:
+                return Summary(primitives=frozenset((k,)))
+
+            if k == "object":
+                if depth == 0:
+                    return Summary(obj={}, truncated=True)
+                keys = list(v.keys())
+                if self.sort_keys:
+                    keys.sort(key=str)
+                truncated = False
+                if (
+                    self.max_keys_per_object is not None
+                    and len(keys) > self.max_keys_per_object
+                ):
+                    keys = keys[: self.max_keys_per_object]
+                    truncated = True
+                children = {str(key): _summarize(v[key], depth - 1) for key in keys}
+                return Summary(obj=children, truncated=truncated)
+
+            if k == "array":
+                return _summarize_array(v, depth, None)
+
+            return Summary(primitives=frozenset(("unknown",)))
+
+        # Root-level array with a progress callback: report while counting.
+        if progress is not None and type(v) is list and depth >= 0:
+            return _summarize_array(v, depth, progress)
+
         return _summarize(v, depth)
 
     def collect_samples(
@@ -348,6 +318,12 @@ class Analyzer:
         _PRIMITIVE_KINDS = PRIMITIVE_KINDS
         store_get = store.get
 
+        # Per-(array-path, kind) sampler cache: elements of one array share
+        # the same path tuple, so this avoids rebuilding the "<items:kind>"
+        # f-string + two tuples and re-hashing the store key for every single
+        # element of every array.
+        items_samplers: dict[tuple[tuple[str, ...], str], ReservoirSampler] = {}
+
         # Stack: (value, path_tuple)
         stack: list[tuple[Any, tuple[str, ...]]] = [(root, ())]
 
@@ -357,14 +333,20 @@ class Analyzer:
 
             if t in _PRIMITIVE_KINDS:
                 if path and path[-1] == "<items>":
-                    spath = path[:-1] + (f"<items:{t}>",)
+                    cache_key = (path, t)
+                    sampler = items_samplers.get(cache_key)
+                    if sampler is None:
+                        spath = path[:-1] + (f"<items:{t}>",)
+                        sampler = store_get(spath)
+                        if sampler is None:
+                            sampler = ReservoirSampler(k, rng)
+                            store[spath] = sampler
+                        items_samplers[cache_key] = sampler
                 else:
-                    spath = path
-
-                sampler = store_get(spath)
-                if sampler is None:
-                    sampler = ReservoirSampler(k, rng)
-                    store[spath] = sampler
+                    sampler = store_get(path)
+                    if sampler is None:
+                        sampler = ReservoirSampler(k, rng)
+                        store[path] = sampler
                 sampler.add(v)
 
             elif t == "object":

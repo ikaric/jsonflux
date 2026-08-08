@@ -661,6 +661,55 @@ def test_sql_format_json(query_engine):
     assert "product_id" in data[0]
 
 
+def test_csv_json_formats_never_truncated():
+    """max_colwidth applies to display formats only — truncating csv/json
+    would silently corrupt exported data."""
+    from jsonflux import QueryEngine
+
+    eng = QueryEngine().register("data", [{"s": "x" * 200}])
+    try:
+        assert "x" * 200 in eng.format_query(
+            "SELECT s FROM data", format="csv", max_colwidth=10
+        )
+        assert "x" * 200 in eng.format_query(
+            "SELECT s FROM data", format="json", max_colwidth=10
+        )
+        # Display formats still truncate.
+        assert "x" * 200 not in eng.format_query(
+            "SELECT s FROM data", format="grid", max_colwidth=10
+        )
+    finally:
+        eng.close()
+
+
+def test_register_path_index_out_of_range():
+    from jsonflux import QueryEngine
+
+    eng = QueryEngine()
+    try:
+        with pytest.raises(ValueError, match="out of range"):
+            eng.register("t", {"items": [[1], [2]]}, path="$.items.5")
+    finally:
+        eng.close()
+
+
+def test_reserved_word_table_name():
+    """A registered table named after a SQL keyword still supports schema()."""
+    from jsonflux import QueryEngine
+
+    eng = QueryEngine().register("select", [{"id": 1}])
+    try:
+        assert "id" in eng.schema("select")
+    finally:
+        eng.close()
+    # A value-wrapped table exercises the DESCRIBE fallback in describe_tables.
+    eng2 = QueryEngine().register("select", [1, 2, 3])
+    try:
+        assert "value" in eng2.describe_tables()
+    finally:
+        eng2.close()
+
+
 # =============================================================================
 # Cross-Table JOIN Tests (Multiple JSON Sources)
 # =============================================================================

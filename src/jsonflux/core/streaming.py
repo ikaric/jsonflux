@@ -23,19 +23,72 @@ from typing import Any
 
 __all__ = ["NotAJsonArray", "iter_elements", "looks_like_array"]
 
+# Whitespace is skipped with plain char loops rather than a regex: between
+# elements of minified JSON there is at most one comma, so the loop exits on
+# its first check, while a regex match costs a call + match-object per skip
+# (measured ~1.7x slower on minified input, the common case).
 _WS = frozenset(" \t\r\n")
+_WS_BYTES = b" \t\r\n"
 _OPEN_BRACKET = 0x5B  # [
-_raw_decode = json.JSONDecoder().raw_decode
+
+
+def _reject_constant(name: str) -> Any:
+    # msgspec's bulk decoder treats NaN/Infinity as invalid JSON; without this
+    # hook the stdlib decoder would accept them and the same document would
+    # parse differently depending on which ingestion path it took.
+    raise ValueError(f"{name} is not valid JSON")
+
+
+_raw_decode = json.JSONDecoder(parse_constant=_reject_constant).raw_decode
 
 
 class NotAJsonArray(Exception):
     """Raised when the text is not a JSON document whose root is ``[…]``."""
 
 
-def looks_like_array(raw: bytes) -> bool:
-    """Cheap check: is the first non-whitespace byte an opening bracket?"""
-    stripped = raw.lstrip()
-    return bool(stripped) and stripped[0] == _OPEN_BRACKET
+def looks_like_array(raw: bytes | str) -> bool:
+    """Cheap check: is the first non-whitespace character an opening bracket?
+
+    Scans forward instead of ``lstrip()``-ing, which would copy the whole
+    buffer just to inspect one character.
+    """
+    if isinstance(raw, bytes):
+        ws: Any = _WS_BYTES
+        bracket: Any = _OPEN_BRACKET
+    else:
+        ws = _WS
+        bracket = "["
+    i = 0
+    n = len(raw)
+    while i < n and raw[i] in ws:
+        i += 1
+    return i < n and raw[i] == bracket
+
+
+def first_nonws_char(s: str) -> str:
+    """First non-whitespace character of ``s`` (empty string if none).
+
+    Used to sniff "JSON text or file path?" without the full-buffer copy a
+    ``strip()`` would make on a multi-megabyte JSON string.
+    """
+    for ch in s:
+        if ch not in _WS:
+            return ch
+    return ""
+
+
+def _require_end(text: str, i: int) -> None:
+    """
+    Reject trailing non-whitespace after the closing bracket.  The bulk
+    decoder treats trailing content as malformed JSON, so the streaming path
+    must too -- silently ignoring it would mean the same file parses
+    differently depending on its size.
+    """
+    n = len(text)
+    while i < n and text[i] in _WS:
+        i += 1
+    if i < n:
+        raise ValueError(f"trailing data after JSON array at position {i}")
 
 
 def iter_elements(text: str) -> Iterator[Any]:
@@ -45,7 +98,8 @@ def iter_elements(text: str) -> Iterator[Any]:
 
     Raises:
         NotAJsonArray: if the root is not an array.
-        ValueError: on malformed structure between elements.
+        ValueError: on malformed structure between elements, trailing data
+            after the array, or non-JSON constants (``NaN``/``Infinity``).
     """
     n = len(text)
     i = 0
@@ -57,6 +111,7 @@ def iter_elements(text: str) -> Iterator[Any]:
     while i < n and text[i] in _WS:
         i += 1
     if i < n and text[i] == "]":
+        _require_end(text, i + 1)
         return  # empty array
 
     raw_decode = _raw_decode
@@ -69,6 +124,7 @@ def iter_elements(text: str) -> Iterator[Any]:
             raise ValueError("unterminated JSON array")
         c = text[i]
         if c == "]":
+            _require_end(text, i + 1)
             return
         if c != ",":
             raise ValueError(f"expected ',' or ']' at position {i}, found {c!r}")

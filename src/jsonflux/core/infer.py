@@ -355,21 +355,29 @@ def _list_schema(root_items: _Node) -> tuple[_Plan, pa.Schema, str]:
     return plan, schema, mode
 
 
-def _chunk_to_rows(chunk: list, plan: _Plan, mode: str) -> list:
-    """Turn decoded elements into Arrow-ready row dicts for the given mode.
+def _chunk_to_batch(
+    chunk: list, plan: _Plan, mode: str, schema: pa.Schema
+) -> pa.RecordBatch:
+    """Turn decoded elements into one Arrow ``RecordBatch``.
 
-    A ``null`` element in an otherwise-object array becomes an all-null row
-    (``{}``); Arrow's ``from_pylist`` cannot take a bare ``None`` for a struct.
+    Record modes go through ``from_pylist``; a ``null`` element in an
+    otherwise-object array becomes an all-null row (``{}``) because
+    ``from_pylist`` cannot take a bare ``None`` for a struct.  Value-wrapped
+    modes build the single ``value`` column directly with ``pa.array``
+    instead of allocating a ``{"value": ...}`` dict per element.
     """
     if mode == "record_fast":
-        return chunk
-    if mode == "record_nullsafe":
-        return [r if type(r) is dict else {} for r in chunk]
-    if mode == "record_coerce":
-        return [_coerce(r, plan) if type(r) is dict else {} for r in chunk]
-    if mode == "value_fast":
-        return [{"value": el} for el in chunk]
-    return [{"value": _coerce(el, plan)} for el in chunk]
+        rows = chunk
+    elif mode == "record_nullsafe":
+        rows = [r if type(r) is dict else {} for r in chunk]
+    elif mode == "record_coerce":
+        rows = [_coerce(r, plan) if type(r) is dict else {} for r in chunk]
+    else:
+        if mode == "value_coerce":
+            chunk = [_coerce(el, plan) for el in chunk]
+        arr = pa.array(chunk, type=schema.types[0])
+        return pa.RecordBatch.from_arrays([arr], schema=schema)
+    return pa.RecordBatch.from_pylist(rows, schema=schema)
 
 
 def _build_from_record(record: dict, max_depth: int) -> pa.Table:
@@ -393,12 +401,12 @@ def _build_from_list(data: list, max_depth: int) -> pa.Table:
     for el in data:
         _accumulate(root_items, el, max_depth)
     plan, schema, mode = _list_schema(root_items)
-    rows = _chunk_to_rows(data, plan, mode)
-    return pa.Table.from_pylist(rows, schema=schema)
+    batch = _chunk_to_batch(data, plan, mode, schema)
+    return pa.Table.from_batches([batch], schema)
 
 
 def build_arrow_table_streaming(
-    raw: bytes,
+    raw: bytes | str,
     max_depth: int = DEFAULT_MAX_DEPTH,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     sample_limit: int = 1000,
@@ -419,7 +427,9 @@ def build_arrow_table_streaming(
     rather than ``full Python graph + Arrow table``.
 
     Args:
-        raw: JSON bytes whose root is an array (caller guarantees this).
+        raw: JSON source whose root is an array (caller guarantees this).
+            Pass ``str`` when the text is already decoded — it lets the caller
+            drop its byte copy so only one copy of the source stays resident.
         max_depth: structural depth before collapsing to JSON strings.
         chunk_size: elements accumulated per Arrow ``RecordBatch``.
         sample_limit: how many leading elements to retain for the display schema.
@@ -430,7 +440,7 @@ def build_arrow_table_streaming(
         changing what the LLM sees.
     """
     keep = sample_limit if sample_limit and sample_limit > 0 else 0
-    text = raw.decode("utf-8")
+    text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
 
     # Pass 1: type model + a bounded head sample.
     root_items = _Node()
@@ -448,16 +458,10 @@ def build_arrow_table_streaming(
     for el in iter_elements(text):
         buf.append(el)
         if len(buf) >= chunk_size:
-            batches.append(
-                pa.RecordBatch.from_pylist(
-                    _chunk_to_rows(buf, plan, mode), schema=schema
-                )
-            )
+            batches.append(_chunk_to_batch(buf, plan, mode, schema))
             buf = []
     if buf:
-        batches.append(
-            pa.RecordBatch.from_pylist(_chunk_to_rows(buf, plan, mode), schema=schema)
-        )
+        batches.append(_chunk_to_batch(buf, plan, mode, schema))
 
     if batches:
         table = pa.Table.from_batches(batches, schema)

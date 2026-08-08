@@ -56,12 +56,53 @@ def test_iter_elements_malformed_raises():
         list(iter_elements("[1, 2"))  # unterminated
 
 
+def test_iter_elements_rejects_trailing_garbage():
+    # The bulk decoder rejects trailing content, so the streaming path must
+    # not silently drop it — the same file has to parse identically on both.
+    for bad in ("[1, 2] x", "[1,2]]", "[] 1", '[1]{"a":1}', "[1,2],"):
+        with pytest.raises(ValueError):
+            list(iter_elements(bad))
+
+
+def test_iter_elements_allows_trailing_whitespace():
+    assert list(iter_elements("[1, 2]  \n\t ")) == [1, 2]
+    assert list(iter_elements("  [ ] \n")) == []
+
+
+def test_iter_elements_rejects_nan_infinity():
+    # msgspec (bulk path) treats these as invalid JSON; stay consistent.
+    for bad in ("[NaN]", "[Infinity]", "[-Infinity]", "[1, NaN, 2]"):
+        with pytest.raises(ValueError):
+            list(iter_elements(bad))
+
+
+def test_streaming_builder_accepts_str():
+    data = [{"a": 1}, {"a": 2.5}, {"a": None}]
+    raw = msgspec.json.encode(data)
+    t_bytes, _ = build_arrow_table_streaming(raw)
+    t_str, _ = build_arrow_table_streaming(raw.decode("utf-8"))
+    assert t_bytes.equals(t_str, check_metadata=False)
+
+
 def test_looks_like_array():
     assert looks_like_array(b"  [1,2,3]")
     assert looks_like_array(b'[\n  {"a":1}\n]')
     assert not looks_like_array(b'{"a": 1}')
     assert not looks_like_array(b"  42")
     assert not looks_like_array(b"")
+
+
+def test_looks_like_array_str():
+    # str input is supported so JSON-string sources need no encode round-trip.
+    assert looks_like_array("  [1,2,3]")
+    assert not looks_like_array('{"a": 1}')
+    assert not looks_like_array("   ")
+    assert not looks_like_array("")
+
+
+def test_iter_elements_pretty_printed():
+    text = '[\n  {\n    "a": 1\n  },\n  {\n    "a": 2\n  }\n]\n'
+    assert list(iter_elements(text)) == [{"a": 1}, {"a": 2}]
 
 
 # ---------------------------------------------------------------------------
