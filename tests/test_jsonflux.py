@@ -1,3 +1,4 @@
+import os
 import time
 
 import pytest
@@ -38,8 +39,10 @@ def test_benchmark_performance(large_dataset):
     t1 = time.perf_counter()
 
     duration = t1 - t0
-    # Uninstrumented this is ~0.35s for ~30k objects; allow headroom for cov.
-    assert duration < 3.0
+    # Uninstrumented this is ~0.35s for ~30k objects; allow headroom for cov,
+    # and more on shared CI runners (slower boxes, older interpreters).
+    limit = 8.0 if os.environ.get("CI") else 3.0
+    assert duration < limit
 
 
 def test_structure_tree_verification(flux_instance):
