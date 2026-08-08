@@ -10,7 +10,12 @@ import duckdb
 import msgspec
 
 from ..core.analyzer import Analyzer, render_schema
-from ..core.infer import DEFAULT_MAX_DEPTH, build_arrow_table
+from ..core.infer import (
+    DEFAULT_MAX_DEPTH,
+    build_arrow_table,
+    build_arrow_table_streaming,
+)
+from ..core.streaming import looks_like_array
 from ..utils.sampling import ReservoirSampler
 from .security import SecurityConfig, interrupt_after
 
@@ -273,6 +278,7 @@ class QueryEngine:
         "security",
         "max_depth",
         "sample_scan_limit",
+        "stream_min_bytes",
         "_closed",
     )
 
@@ -287,6 +293,7 @@ class QueryEngine:
         max_result_rows: int | None = -1,
         max_depth: int = DEFAULT_MAX_DEPTH,
         sample_scan_limit: int = 1000,
+        stream_min_bytes: int = 4 * 1024 * 1024,
     ):
         """
         Create a sandboxed SQL engine.
@@ -319,6 +326,12 @@ class QueryEngine:
                 stride-sampled across the whole dataset so the examples stay
                 representative without a full traversal.  This never affects
                 the queryable table (which always scans every row).
+            stream_min_bytes: File / JSON-string array sources at least this
+                many bytes are ingested with the low-memory streaming decoder
+                (peak memory ~2-4x the JSON size instead of ~5-9x), which trades
+                some ingestion speed for a much smaller footprint.  Smaller
+                inputs — and all in-memory ``dict``/``list`` sources — take the
+                fast bulk-decode path.  Set to ``0`` to always stream.
         """
         if security is None:
             security = SecurityConfig()
@@ -337,6 +350,7 @@ class QueryEngine:
         self.security = security
         self.max_depth = max_depth
         self.sample_scan_limit = sample_scan_limit
+        self.stream_min_bytes = stream_min_bytes
         self.conn = security.connect()
         self.tables: dict[str, dict[str, Any]] = {}
         self._closed = False
@@ -365,45 +379,71 @@ class QueryEngine:
         # Validate the name before any I/O -- it is interpolated into SQL.
         _validate_identifier(name)
 
-        # Determine source type and load data
+        # Determine the source.  For file / JSON-string sources we keep the raw
+        # bytes so we can stream-decode them (low memory); in-memory sources are
+        # already fully materialised by the caller, so streaming would not save
+        # anything and we take the fast path.
+        raw: bytes | None = None
+        data: Any = None
         if isinstance(source, (dict, list)):
             data = source
             source_desc = "memory"
         elif isinstance(source, (str, Path)):
             source_str = str(source)
-            if source_str.strip().startswith("{") or source_str.strip().startswith("["):
-                data = msgspec.json.decode(source_str)
+            stripped = source_str.strip()
+            if stripped.startswith("{") or stripped.startswith("["):
+                raw = source_str.encode("utf-8")
                 source_desc = "json_string"
             else:
                 with open(source_str, "rb") as f:
-                    data = msgspec.json.decode(f.read())
+                    raw = f.read()
                 source_desc = source_str
         else:
             raise TypeError(f"Unsupported source type: {type(source)}")
 
-        if path:
-            data = self._extract_path(data, path)
+        # Streaming ingestion applies to large raw array sources with no JSON
+        # path to navigate (a path requires the whole object graph to walk).
+        # Small inputs take the faster bulk-decode path -- their graph is tiny.
+        use_streaming = (
+            raw is not None
+            and path is None
+            and len(raw) >= self.stream_min_bytes
+            and looks_like_array(raw)
+        )
 
-        if not isinstance(data, (dict, list)):
-            raise ValueError(
-                f"Data at path must be a JSON object or array, got "
-                f"{type(data).__name__}"
+        if use_streaming:
+            # Build the Arrow table one chunk at a time; only a bounded head
+            # sample of records is retained for the display schema.
+            table, sample_rows_all = build_arrow_table_streaming(
+                raw,
+                max_depth=self.max_depth,
+                sample_limit=self.sample_scan_limit or 1000,
             )
+            summary_source = sample_rows_all
+        else:
+            if raw is not None:
+                data = msgspec.json.decode(raw)
+            if path:
+                data = self._extract_path(data, path)
+            if not isinstance(data, (dict, list)):
+                raise ValueError(
+                    f"Data at path must be a JSON object or array, got "
+                    f"{type(data).__name__}"
+                )
+            # Build a lossless Arrow table: every row and field is scanned so no
+            # key is dropped and no value is silently truncated (see core.infer).
+            table = build_arrow_table(data, max_depth=self.max_depth)
+            summary_source = [data] if isinstance(data, dict) else data
 
-        # Build a lossless Arrow table: every row and field is scanned so no
-        # key is dropped and no value is silently truncated (see core.infer).
-        table = build_arrow_table(data, max_depth=self.max_depth)
         self.conn.register(name, table)
 
         # Keep a summary for the LLM-facing schema/prompt rendering.  This is a
         # sampled, display-oriented view; the queryable table above is the
         # source of truth for correctness.
-        if isinstance(data, dict):
-            data = [data]
         analyzer = Analyzer()
-        summary = analyzer.summarize(data, analyzer.max_depth)
+        summary = analyzer.summarize(summary_source, analyzer.max_depth)
 
-        row_count = len(table)
+        row_count = table.num_rows
         columns = table.column_names
 
         # A non-object root (list of primitives, arrays, or mixed types) is
@@ -421,11 +461,11 @@ class QueryEngine:
         sample_store: dict[tuple[str, ...], ReservoirSampler] = {}
         rng = random.Random(12345)
         limit = self.sample_scan_limit
-        if limit and len(data) > limit:
-            stride = len(data) // limit
-            sample_rows = data[::stride]
+        if limit and len(summary_source) > limit:
+            stride = len(summary_source) // limit
+            sample_rows = summary_source[::stride]
         else:
-            sample_rows = data
+            sample_rows = summary_source
         analyzer.collect_samples(sample_rows, sample_store, k=3, rng=rng)
 
         self.tables[name] = {
