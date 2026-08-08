@@ -4,7 +4,10 @@
 
 **High-performance JSON structure analysis and SQL querying for Python**
 
+[![PyPI](https://img.shields.io/pypi/v/jsonflux?color=306998&logo=pypi&logoColor=white)](https://pypi.org/project/jsonflux/)
 [![Python](https://img.shields.io/badge/Python-3.9+-3776AB?logo=python&logoColor=white)](https://python.org)
+[![Platforms](https://img.shields.io/badge/Platforms-Linux%20%7C%20macOS%20%7C%20Windows-4c1)](https://pypi.org/project/jsonflux/#files)
+[![Tests](https://github.com/ikaric/jsonflux/actions/workflows/tests.yml/badge.svg)](https://github.com/ikaric/jsonflux/actions/workflows/tests.yml)
 [![DuckDB](https://img.shields.io/badge/DuckDB-SQL%20Engine-FFF000?logo=duckdb&logoColor=black)](https://duckdb.org)
 [![msgspec](https://img.shields.io/badge/msgspec-Fast%20JSON-5B4FC3)](https://jcristharif.com/msgspec/)
 [![PyArrow](https://img.shields.io/badge/PyArrow-Zero%20Copy-E34F26)](https://arrow.apache.org/docs/python/)
@@ -1407,30 +1410,6 @@ errors = validate()
 if errors:
     print("Validation failed:", errors)
 ```
-
----
-
-## 🛠️ Tech Stack
-
-<table>
-<tr>
-<td align="center" width="120">
-<img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/python/python-original.svg" width="48" height="48" alt="Python" />
-<br><strong>Python 3.9+</strong>
-<br><sub>Core language</sub>
-</td>
-<td align="center" width="120">
-<img src="https://duckdb.org/images/logo-dl/DuckDB_Logo.png" width="48" height="48" alt="DuckDB" />
-<br><strong>DuckDB</strong>
-<br><sub>SQL engine</sub>
-</td>
-<td align="center" width="120">
-<img src="https://arrow.apache.org/img/arrow-logo_hex_black-txt_white-bg.png" width="48" height="48" alt="Arrow" />
-<br><strong>PyArrow</strong>
-<br><sub>Data transfer</sub>
-</td>
-</tr>
-</table>
 
 ---
 
