@@ -54,7 +54,7 @@ collect_stats = collect_stats_fn
 # Version
 # --------------------------
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 # --------------------------
 # Public API exports

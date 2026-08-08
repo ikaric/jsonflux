@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jsonflux"
-version = "1.0.0"
+version = "1.0.1"
 description = "High-performance JSON structure analysis and SQL querying"
 readme = "README.md"
 requires-python = ">=3.9"
