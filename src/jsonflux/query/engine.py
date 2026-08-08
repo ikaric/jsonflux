@@ -10,7 +10,12 @@ import duckdb
 import msgspec
 
 from ..core.analyzer import Analyzer, render_schema
-from ..core.infer import DEFAULT_MAX_DEPTH, build_arrow_table
+from ..core.infer import (
+    DEFAULT_MAX_DEPTH,
+    build_arrow_table,
+    build_arrow_table_streaming,
+)
+from ..core.streaming import first_nonws_char, looks_like_array
 from ..utils.sampling import ReservoirSampler
 from .security import SecurityConfig, interrupt_after
 
@@ -108,28 +113,21 @@ def _scannable_column_indices(description: Any) -> list[int]:
     return idx
 
 
-def _enforce_byte_cap(
-    rows: list[tuple[Any, ...]], byte_cap: int, col_indices: list[int]
-) -> None:
-    """
-    Reject a result whose string/blob/nested payload exceeds ``byte_cap``.
+# Rows pulled per fetchmany() call while materialising a capped result.  Small
+# enough that an oversized result is rejected after at most one extra batch of
+# Python objects, large enough that per-call overhead stays negligible.
+_FETCH_BATCH_ROWS = 8192
 
-    Only ``col_indices`` (variable-length columns) are measured, and scanning
-    stops as soon as the budget is blown -- so numeric results and the common
-    small case are nearly free.
-    """
-    if not col_indices:
-        return
+
+def _batch_bytes(rows: list[tuple[Any, ...]], col_indices: list[int]) -> int:
+    """Sum the variable-length payload bytes of ``rows`` over ``col_indices``
+    (only variable-length columns are measured -- see
+    :func:`_scannable_column_indices`)."""
     total = 0
     for row in rows:
         for i in col_indices:
             total += _cell_bytes(row[i])
-        if total > byte_cap:
-            raise ResultTooLargeError(
-                f"Query result exceeds the {byte_cap:,}-byte cap. Narrow the "
-                "columns/rows selected, raise QueryEngine(security=SecurityConfig"
-                "(max_result_bytes=…)), or stream with query_iter()."
-            )
+    return total
 
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -273,6 +271,7 @@ class QueryEngine:
         "security",
         "max_depth",
         "sample_scan_limit",
+        "stream_min_bytes",
         "_closed",
     )
 
@@ -287,6 +286,7 @@ class QueryEngine:
         max_result_rows: int | None = -1,
         max_depth: int = DEFAULT_MAX_DEPTH,
         sample_scan_limit: int = 1000,
+        stream_min_bytes: int = 4 * 1024 * 1024,
     ):
         """
         Create a sandboxed SQL engine.
@@ -319,6 +319,12 @@ class QueryEngine:
                 stride-sampled across the whole dataset so the examples stay
                 representative without a full traversal.  This never affects
                 the queryable table (which always scans every row).
+            stream_min_bytes: File / JSON-string array sources at least this
+                many bytes are ingested with the low-memory streaming decoder
+                (peak memory ~2-4x the JSON size instead of ~5-9x), which trades
+                some ingestion speed for a much smaller footprint.  Smaller
+                inputs — and all in-memory ``dict``/``list`` sources — take the
+                fast bulk-decode path.  Set to ``0`` to always stream.
         """
         if security is None:
             security = SecurityConfig()
@@ -337,6 +343,7 @@ class QueryEngine:
         self.security = security
         self.max_depth = max_depth
         self.sample_scan_limit = sample_scan_limit
+        self.stream_min_bytes = stream_min_bytes
         self.conn = security.connect()
         self.tables: dict[str, dict[str, Any]] = {}
         self._closed = False
@@ -365,45 +372,82 @@ class QueryEngine:
         # Validate the name before any I/O -- it is interpolated into SQL.
         _validate_identifier(name)
 
-        # Determine source type and load data
+        # Determine the source.  JSON-string sources are consumed as ``str``
+        # directly (both msgspec and the streaming decoder accept str), so no
+        # encode round-trip and no full ``strip()`` copy is ever made; file
+        # sources keep the raw bytes only until they are decoded.  In-memory
+        # sources are already fully materialised by the caller, so streaming
+        # would not save anything and we take the fast path.
+        raw: bytes | None = None
+        text: str | None = None
+        data: Any = None
         if isinstance(source, (dict, list)):
             data = source
             source_desc = "memory"
         elif isinstance(source, (str, Path)):
             source_str = str(source)
-            if source_str.strip().startswith("{") or source_str.strip().startswith("["):
-                data = msgspec.json.decode(source_str)
+            if first_nonws_char(source_str) in ("{", "["):
+                text = source_str
                 source_desc = "json_string"
             else:
                 with open(source_str, "rb") as f:
-                    data = msgspec.json.decode(f.read())
+                    raw = f.read()
                 source_desc = source_str
         else:
             raise TypeError(f"Unsupported source type: {type(source)}")
 
-        if path:
-            data = self._extract_path(data, path)
+        # Streaming ingestion applies to large raw array sources with no JSON
+        # path to navigate (a path requires the whole object graph to walk).
+        # Small inputs take the faster bulk-decode path -- their graph is tiny.
+        blob: bytes | str | None = raw if raw is not None else text
+        use_streaming = (
+            blob is not None
+            and path is None
+            and len(blob) >= self.stream_min_bytes
+            and looks_like_array(blob)
+        )
+        del blob
 
-        if not isinstance(data, (dict, list)):
-            raise ValueError(
-                f"Data at path must be a JSON object or array, got "
-                f"{type(data).__name__}"
+        if use_streaming:
+            # Build the Arrow table one chunk at a time; only a bounded head
+            # sample of records is retained for the display schema.  File
+            # bytes are decoded here and the byte copy dropped, so peak memory
+            # holds one copy of the source text instead of two.
+            if text is None:
+                text = raw.decode("utf-8")  # type: ignore[union-attr]
+                raw = None
+            table, sample_rows_all = build_arrow_table_streaming(
+                text,
+                max_depth=self.max_depth,
+                sample_limit=self.sample_scan_limit or 1000,
             )
+            summary_source = sample_rows_all
+        else:
+            if raw is not None:
+                data = msgspec.json.decode(raw)
+            elif text is not None:
+                data = msgspec.json.decode(text)
+            if path:
+                data = self._extract_path(data, path)
+            if not isinstance(data, (dict, list)):
+                raise ValueError(
+                    f"Data at path must be a JSON object or array, got "
+                    f"{type(data).__name__}"
+                )
+            # Build a lossless Arrow table: every row and field is scanned so no
+            # key is dropped and no value is silently truncated (see core.infer).
+            table = build_arrow_table(data, max_depth=self.max_depth)
+            summary_source = [data] if isinstance(data, dict) else data
 
-        # Build a lossless Arrow table: every row and field is scanned so no
-        # key is dropped and no value is silently truncated (see core.infer).
-        table = build_arrow_table(data, max_depth=self.max_depth)
         self.conn.register(name, table)
 
         # Keep a summary for the LLM-facing schema/prompt rendering.  This is a
         # sampled, display-oriented view; the queryable table above is the
         # source of truth for correctness.
-        if isinstance(data, dict):
-            data = [data]
         analyzer = Analyzer()
-        summary = analyzer.summarize(data, analyzer.max_depth)
+        summary = analyzer.summarize(summary_source, analyzer.max_depth)
 
-        row_count = len(table)
+        row_count = table.num_rows
         columns = table.column_names
 
         # A non-object root (list of primitives, arrays, or mixed types) is
@@ -421,11 +465,11 @@ class QueryEngine:
         sample_store: dict[tuple[str, ...], ReservoirSampler] = {}
         rng = random.Random(12345)
         limit = self.sample_scan_limit
-        if limit and len(data) > limit:
-            stride = len(data) // limit
-            sample_rows = data[::stride]
+        if limit and len(summary_source) > limit:
+            stride = len(summary_source) // limit
+            sample_rows = summary_source[::stride]
         else:
-            sample_rows = data
+            sample_rows = summary_source
         analyzer.collect_samples(sample_rows, sample_store, k=3, rng=rng)
 
         self.tables[name] = {
@@ -486,7 +530,13 @@ class QueryEngine:
             if isinstance(current, dict):
                 current = current.get(part)
             elif isinstance(current, list) and part.isdigit():
-                current = current[int(part)]
+                idx = int(part)
+                if idx >= len(current):
+                    raise ValueError(
+                        f"Index {idx} out of range in path '{path}' "
+                        f"(array has {len(current)} elements)"
+                    )
+                current = current[idx]
             else:
                 raise ValueError(f"Cannot navigate to '{part}' in path '{path}'")
             if current is None:
@@ -528,7 +578,10 @@ class QueryEngine:
 
         Returns ``(columns, rows)``.  The interrupt watchdog stays armed
         through the fetch because DuckDB executes lazily -- the real work
-        happens during the fetch, not the ``execute`` call.
+        happens during the fetch, not the ``execute`` call.  When a cap is
+        set, rows are pulled in bounded batches and the caps are enforced as
+        rows arrive, so an oversized result is rejected after at most one
+        batch beyond the cap instead of after full materialisation.
 
         Raises:
             TimeoutError: if the query exceeds ``query_timeout``.
@@ -540,32 +593,51 @@ class QueryEngine:
         self._check_readonly(sql)
         row_cap = self.security.max_result_rows
         byte_cap = self.security.max_result_bytes
+        rows: list[tuple[Any, ...]] = []
         try:
             with interrupt_after(self.conn, self._timeout()):
                 result = self.conn.execute(sql)
                 description = result.description
                 columns = [desc[0] for desc in description]
-                if row_cap is None:
+                if row_cap is None and byte_cap is None:
                     rows = result.fetchall()
                 else:
-                    # Fetch at most one row beyond the cap: bounds the number of
-                    # rows pulled into Python before we can reject an oversized
-                    # result.
-                    rows = result.fetchmany(row_cap + 1)
+                    scan_cols = (
+                        _scannable_column_indices(description)
+                        if byte_cap is not None
+                        else []
+                    )
+                    seen_bytes = 0
+                    while True:
+                        want = _FETCH_BATCH_ROWS
+                        if row_cap is not None:
+                            # Never pull more than one row past the cap.
+                            want = min(want, row_cap + 1 - len(rows))
+                        batch = result.fetchmany(want)
+                        if not batch:
+                            break
+                        rows.extend(batch)
+                        if row_cap is not None and len(rows) > row_cap:
+                            raise ResultTooLargeError(
+                                f"Query returned more than the {row_cap:,}-row "
+                                "cap. Add a LIMIT or aggregate, raise "
+                                "QueryEngine(max_result_rows=…), or use "
+                                "query_iter()/query_arrow() for large results."
+                            )
+                        if scan_cols:
+                            seen_bytes += _batch_bytes(batch, scan_cols)
+                            if seen_bytes > byte_cap:
+                                raise ResultTooLargeError(
+                                    f"Query result exceeds the {byte_cap:,}-byte "
+                                    "cap. Narrow the columns/rows selected, raise "
+                                    "QueryEngine(security=SecurityConfig"
+                                    "(max_result_bytes=…)), or stream with "
+                                    "query_iter()."
+                                )
         except duckdb.InterruptException as e:
             raise TimeoutError(
                 f"Query exceeded the {self._timeout()}s timeout and was cancelled."
             ) from e
-
-        if row_cap is not None and len(rows) > row_cap:
-            raise ResultTooLargeError(
-                f"Query returned more than the {row_cap:,}-row cap. Add a LIMIT "
-                "or aggregate, raise QueryEngine(max_result_rows=…), or use "
-                "query_iter()/query_arrow() for large results."
-            )
-
-        if byte_cap is not None:
-            _enforce_byte_cap(rows, byte_cap, _scannable_column_indices(description))
 
         return columns, rows
 
@@ -585,12 +657,17 @@ class QueryEngine:
         rather than the total streaming duration, so slow *consumers* are not
         penalised while a pathological *query* is still cut off.
 
+        Validation and query start happen eagerly at call time — a read-only
+        violation, SQL error, or timeout on the initial execution raises
+        immediately rather than on first iteration.  Only row fetching is
+        lazy.
+
         Args:
             sql: SQL query string
             batch_size: Number of rows to fetch per batch (default 1000)
 
-        Yields:
-            dict for each result row
+        Returns:
+            Iterator yielding a dict per result row
         """
         self._check_readonly(sql)
         timeout = self._timeout()
@@ -598,17 +675,26 @@ class QueryEngine:
             with interrupt_after(self.conn, timeout):
                 result = self.conn.execute(sql)
                 columns = [desc[0] for desc in result.description]
-            while True:
-                with interrupt_after(self.conn, timeout):
-                    batch = result.fetchmany(batch_size)
-                if not batch:
-                    break
-                for row in batch:
-                    yield dict(zip(columns, row))
         except duckdb.InterruptException as e:
             raise TimeoutError(
                 f"Query exceeded the {timeout}s timeout and was cancelled."
             ) from e
+
+        def _iterate() -> Iterator[dict[str, Any]]:
+            try:
+                while True:
+                    with interrupt_after(self.conn, timeout):
+                        batch = result.fetchmany(batch_size)
+                    if not batch:
+                        break
+                    for row in batch:
+                        yield dict(zip(columns, row))
+            except duckdb.InterruptException as e:
+                raise TimeoutError(
+                    f"Query exceeded the {timeout}s timeout and was cancelled."
+                ) from e
+
+        return _iterate()
 
     def query_arrow(self, sql: str):
         """Execute SQL and return as PyArrow Table."""
@@ -635,9 +721,17 @@ class QueryEngine:
             return self.conn.execute(sql)
 
     def explain(self, sql: str) -> str:
-        """Show query execution plan."""
-        result = self.conn.execute(f"EXPLAIN {sql}").fetchall()
-        return "\n".join(row[0] for row in result)
+        """
+        Show the query execution plan (without running the query).
+
+        Routed through the same guarded fetch as :meth:`query` so read-only
+        enforcement and the query timeout apply — the input is still
+        arbitrary SQL, and multi-statement text could otherwise smuggle a
+        write past the ``EXPLAIN`` prefix.
+        """
+        _, rows = self._fetch(f"EXPLAIN {sql}")
+        # EXPLAIN rows are (key, value) pairs, e.g. ("physical_plan", <plan>).
+        return "\n".join(str(row[1]) for row in rows)
 
     def tables_info(self) -> str:
         """Show registered tables and their info."""
@@ -653,9 +747,11 @@ class QueryEngine:
     def schema(self, table: str) -> str:
         """Show schema of a table."""
         # ``table`` is interpolated into SQL; require a plain identifier so this
-        # cannot be used to smuggle a subquery or a second statement.
+        # cannot be used to smuggle a subquery or a second statement.  Quoting
+        # (safe: the identifier cannot contain quotes) also lets reserved words
+        # like ``select`` work as table names.
         _validate_identifier(table)
-        result = self.conn.execute(f"DESCRIBE {table}").fetchall()
+        result = self.conn.execute(f'DESCRIBE "{table}"').fetchall()
         lines = [f"Schema of '{table}':"]
         for row in result:
             lines.append(f"  {row[0]}: {row[1]}")
@@ -728,7 +824,7 @@ class QueryEngine:
                 lines.append(schema_str)
                 lines.append("```")
             else:
-                schema_raw = self.conn.execute(f"DESCRIBE {table_name}").fetchall()
+                schema_raw = self.conn.execute(f'DESCRIBE "{table_name}"').fetchall()
                 lines.append("| Column | Type |")
                 lines.append("|--------|------|")
                 for row in schema_raw:
@@ -1211,8 +1307,10 @@ class QueryEngine:
         # Use leaf name for comparison (e.g. "customer.customer_id" -> "customer_id")
         leaf1 = col1.rsplit(".", 1)[-1].lower()
         leaf2 = col2.rsplit(".", 1)[-1].lower()
-        t1_lower = t1.lower().rstrip("s")  # "products" -> "product"
-        t2_lower = t2.lower().rstrip("s")
+        # removesuffix, not rstrip: rstrip("s") would strip every trailing
+        # "s" ("boss" -> "bo") instead of the plural suffix only.
+        t1_lower = t1.lower().removesuffix("s")  # "products" -> "product"
+        t2_lower = t2.lower().removesuffix("s")
 
         # Same leaf name ending in _id — very likely a join key
         # e.g., products.product_id ↔ orders.customer.customer_id is NOT a match,
@@ -1262,16 +1360,6 @@ class QueryEngine:
         if max_rows is not None:
             rows = rows[:max_rows]
 
-        # Truncate long string values if max_colwidth is set
-        if max_colwidth is not None:
-
-            def truncate(val: Any) -> Any:
-                if isinstance(val, str) and len(val) > max_colwidth:
-                    return val[: max_colwidth - 1] + "…"
-                return val
-
-            rows = [tuple(truncate(v) for v in row) for row in rows]
-
         if format == "csv":
             import csv
             import io
@@ -1285,6 +1373,17 @@ class QueryEngine:
             data = [dict(zip(columns, row)) for row in rows]
             return msgspec.json.encode(data).decode("utf-8")
         elif format in ("simple", "grid", "pipe", "markdown", "github"):
+            # Truncation applies to display formats only; csv/json are data
+            # formats where silently shortening values would corrupt the
+            # payload.
+            if max_colwidth is not None:
+
+                def truncate(val: Any) -> Any:
+                    if isinstance(val, str) and len(val) > max_colwidth:
+                        return val[: max_colwidth - 1] + "…"
+                    return val
+
+                rows = [tuple(truncate(v) for v in row) for row in rows]
             tablefmt = "github" if format == "markdown" else format
             return tabulate(rows, headers=columns, tablefmt=tablefmt)
         else:
@@ -1307,7 +1406,8 @@ class QueryEngine:
             sql: SQL query string
             format: Output format - "simple", "grid", "pipe", "markdown", "csv", "json"
             max_rows: Limit rows shown (None = all)
-            max_colwidth: Max column width (None = unlimited)
+            max_colwidth: Max column width (None = unlimited).  Applies to
+                display formats only; csv/json output is never truncated.
 
         Returns:
             Formatted string, or an error message prefixed with "ERROR: "
@@ -1365,7 +1465,9 @@ class QueryEngine:
 
     def close(self) -> None:
         """Close the DuckDB connection and release resources."""
-        if not self._closed:
+        # getattr: __del__ may see a partially-constructed instance when
+        # __init__ raised before these attributes were assigned.
+        if not getattr(self, "_closed", True):
             self._closed = True
             self.tables.clear()
             try:

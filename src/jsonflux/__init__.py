@@ -37,6 +37,7 @@ from .core.stats import (
 from .core.stats import (
     collect_stats as collect_stats_fn,
 )
+from .core.streaming import first_nonws_char
 from .query.engine import (
     QueryEngine,
     QueryResult,
@@ -273,8 +274,9 @@ class JsonFlux:
             if os.path.exists(source):
                 with open(source, "rb") as f:
                     return msgspec.json.decode(f.read()), "file"
-            source_stripped = source.strip()
-            if source_stripped.startswith("{") or source_stripped.startswith("["):
+            # First-char sniff instead of strip(): strip() would copy a
+            # multi-megabyte JSON string just to look at one character.
+            if first_nonws_char(source) in ("{", "["):
                 return msgspec.json.decode(source), "json_string"
             # Try parsing as a JSON scalar (e.g. "true", "42", '"hello"')
             try:
@@ -427,7 +429,8 @@ class JsonFlux:
             sql: SQL query string
             format: Output format - 'simple', 'grid', 'pipe', 'markdown', 'csv', 'json'
             max_rows: Limit rows shown (None = all, default 20)
-            max_colwidth: Max column width (None = unlimited, default 50)
+            max_colwidth: Max column width (None = unlimited, default 50).
+                Applies to display formats only; csv/json is never truncated.
 
         Returns:
             Formatted string, or an error message prefixed with "ERROR: "
@@ -494,8 +497,11 @@ class JsonFlux:
 
     def close(self) -> None:
         """Close the cached query engine and release resources."""
-        if self._engine is not None:
-            self._engine.close()
+        # getattr: __del__ may see a partially-constructed instance when
+        # __init__ raised before _engine was assigned.
+        engine = getattr(self, "_engine", None)
+        if engine is not None:
+            engine.close()
             self._engine = None
 
     def __repr__(self) -> str:

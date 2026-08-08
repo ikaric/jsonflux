@@ -226,9 +226,11 @@ engine = QueryEngine().register("t",
 engine.query("SELECT v FROM t WHERE id = 10000")   # -> [{'v': 3.7}]  ✅
 ```
 
-This full scan is also **faster** than the old sampled path (~44 ms vs ~180 ms
-for 15k nested records) because clean data skips per-row Python normalization
-entirely.
+The full scan is cheap because clean data (no type conflicts) is handed to Arrow
+without any per-row Python normalization; only conflicting columns are coerced.
+For large files, ingestion also **streams** — decoding one element at a time
+instead of building the whole Python object graph up front — which cuts peak
+memory 2-3x (see [Performance](#-performance)).
 
 ---
 
@@ -1185,39 +1187,71 @@ flux.analyze(['{"id": 1}', '{"id": 2}', '{"id": 3}'])
 
 ## ⚡ Performance
 
-JSONFlux is optimized for speed:
+JSONFlux is optimized for speed *and* peak memory:
 
 | Optimization | Description |
 |--------------|-------------|
 | **msgspec** | 2-10x faster JSON parsing than stdlib |
 | **DuckDB** | Columnar, vectorized SQL execution |
 | **PyArrow** | Zero-copy data transfer between Python and DuckDB |
-| **Iterative algorithms** | Avoids recursion limits on deep structures |
-| **Local variable caching** | Optimized hot paths |
+| **Streaming ingestion** | Large files decode one element at a time → ~2-3x lower peak RAM |
+| **Fast/slow inference split** | Clean data skips per-row Python normalization |
 | **`__slots__`** | Memory-efficient class instances |
 
 ### Benchmarks
 
-Measured on 15,000 nested order records (each with an `items` array and a
-`meta` object), best-of-5, via [`bench/benchmark.py`](bench/benchmark.py):
+All numbers come from [`bench/benchmark.py`](bench/benchmark.py), which measures
+honestly: every timing is the **mean ± stddev over 7 repeats** after a warm-up,
+throughput is reported in the unit that matters (MB/s, records/s, rows/s), and
+peak memory is measured as **peak RSS in an isolated subprocess** (so it captures
+the msgspec object graph *and* the Arrow allocation, not just Python heap).
 
-| Operation | Records | Time |
-|-----------|---------|------|
-| `register` (decode + lossless Arrow table) | 15,000 | ~44 ms |
-| `GROUP BY` aggregation → dicts | 15,000 | ~2 ms |
-| `UNNEST` + `GROUP BY` (nested arrays) | 15,000 | ~3 ms |
-| Point filter (`WHERE`) | 15,000 | ~1 ms |
-| Schema/prompt generation for the LLM | — | ~0.02 ms |
-| **Sandbox overhead** vs. an unsecured connection | — | **~0 ms** |
+Machine: the figures below are from one development machine; run it yourself with
+`uv run python bench/benchmark.py --repeat 7 --sizes 20000,100000`.
 
-Run it yourself:
+**Ingestion throughput** (register). In-memory `dict`/`list` sources and files
+below `stream_min_bytes` (default 4 MB) take the fast bulk path; larger files
+stream.
 
-```bash
-uv run python bench/benchmark.py --rows 50000 --repeat 5
+| Shape | Records | JSON | Source | Time | MB/s | records/s |
+|-------|--------:|-----:|--------|-----:|-----:|----------:|
+| flat | 100k | 8.2 MB | memory | 78 ms | 106 | 1,290,000 |
+| flat | 100k | 8.2 MB | file (stream) | 167 ms | 50 | 600,000 |
+| nested | 100k | 20.4 MB | memory | 257 ms | 79 | 389,000 |
+| nested | 100k | 20.4 MB | file (stream) | 478 ms | 43 | 209,000 |
+| wide | 100k | 50.6 MB | memory | 437 ms | 116 | 229,000 |
+
+**Ingestion peak memory** — the headline improvement. Streaming decode replaces
+the "decode the whole file into a Python graph first" approach; peak RSS over the
+import baseline, as a multiple of the JSON size:
+
+| Shape | Records | JSON | Bulk (before) | Streaming (after) | Saved |
+|-------|--------:|-----:|--------------:|------------------:|------:|
+| flat | 100k | 8.2 MB | 69 MB (8.4×) | **32 MB (3.9×)** | 53% |
+| nested | 100k | 20.4 MB | 196 MB (9.6×) | **64 MB (3.1×)** | 67% |
+| wide | 100k | 50.6 MB | 279 MB (5.5×) | **136 MB (2.7×)** | 51% |
+
+Streaming trades ~30-50% ingestion throughput for that memory (a one-time cost on
+`register`); it applies only to file/JSON-string array sources at or above
+`stream_min_bytes`. Tune or disable it per engine:
+
+```python
+QueryEngine(stream_min_bytes=0)        # always stream (lowest memory)
+QueryEngine(stream_min_bytes=10**12)   # never stream (fastest ingest)
 ```
 
-The sandbox is essentially free: locking the connection down is a one-time
-startup cost that does not touch the query hot path.
+**Queries** (nested, 100k rows) — unaffected by the ingestion changes:
+
+| Query | Time | rows out | rows/s |
+|-------|-----:|---------:|-------:|
+| `GROUP BY` aggregation | 4.4 ms | 3 | — |
+| filter (`WHERE`) | 8.5 ms | 1,000 | 118,000 |
+| `UNNEST` + `GROUP BY` | 10.5 ms | 501 | 47,000 |
+| full scan → list of dicts | 398 ms | 100,000 | 251,000 |
+
+A full-table scan into Python dicts costs ~2 KB/row (100k nested rows ≈ 218 MB
+resident). For large result sets, prefer `query_arrow()` (columnar, streaming
+reader) or `query_iter()` (batched) — both bypass that materialization.
 
 ### Timing Information
 
@@ -1251,7 +1285,7 @@ print(f"Total: {timing['total_time']:.3f}s")
 
 ### QueryEngine Class
 
-**Constructor:** `QueryEngine(security=None, *, allow_external_access=None, memory_limit=None, query_timeout=None, read_only=None, max_result_rows=…, max_depth=64, sample_scan_limit=1000)` — sandboxed and read-only by default; see [Security & Sandboxing](#-security--sandboxing).
+**Constructor:** `QueryEngine(security=None, *, allow_external_access=None, memory_limit=None, query_timeout=None, read_only=None, max_result_rows=…, max_depth=64, sample_scan_limit=1000, stream_min_bytes=4194304)` — sandboxed and read-only by default; file/JSON-string array sources ≥ `stream_min_bytes` stream for low memory. See [Security & Sandboxing](#-security--sandboxing) and [Performance](#-performance).
 
 | Method | Description |
 |--------|-------------|
@@ -1324,13 +1358,14 @@ pip install -e ".[dev]"
 
 ### Testing
 
-The suite contains **253 tests** across four files:
+The suite contains **289 tests** across five files:
 
 | File | Tests | Focus |
 |------|-------|-------|
 | `test_jsonflux.py` | 100 | SQL fundamentals, JOINs, nested/UNNEST queries, LLM prompt generation |
 | `test_inference.py` | 39 | Every JSON type combination & conflict — lossless, crash-free ingestion |
 | `test_security.py` | 82 | Sandbox, read-only mode, result caps, timeout, memory, injection, creative file-write vectors |
+| `test_streaming.py` | 36 | Low-memory streaming ingestion == bulk path (fuzzed element iterator + table builder) |
 | `test_performance.py` | 32 | Caching, iterative merge, streaming, regression guards |
 
 `test_jsonflux.py` runs against a deterministic generated dataset (seed=42) with

@@ -29,7 +29,14 @@ from typing import Any
 import msgspec
 import pyarrow as pa
 
-__all__ = ["build_arrow_table", "DEFAULT_MAX_DEPTH"]
+from .streaming import iter_elements
+
+__all__ = [
+    "build_arrow_table",
+    "build_arrow_table_streaming",
+    "DEFAULT_MAX_DEPTH",
+    "DEFAULT_CHUNK_SIZE",
+]
 
 INT64_MIN = -(2**63)
 INT64_MAX = 2**63 - 1
@@ -38,6 +45,11 @@ INT64_MAX = 2**63 - 1
 # Real-world API payloads are rarely deeper than a handful of levels; this bound
 # keeps inference recursion safe and predictable.
 DEFAULT_MAX_DEPTH = 64
+
+# Elements decoded per chunk in the streaming ingestion path.  Bounds the number
+# of Python objects live at once; a whole chunk is decoded in one msgspec call so
+# per-element overhead stays amortised.
+DEFAULT_CHUNK_SIZE = 2048
 
 _json_encode = msgspec.json.Encoder().encode
 
@@ -312,6 +324,62 @@ def _struct_plan_to_schema(plan: _Plan) -> pa.Schema:
     return pa.schema(list(plan.dtype))
 
 
+def _list_schema(root_items: _Node) -> tuple[_Plan, pa.Schema, str]:
+    """
+    Resolve a list's element node into ``(plan, arrow schema, mode)``.
+
+    ``mode`` selects how each element becomes an Arrow row:
+    ``record_fast`` (elements are all dicts, no coercion — passed straight
+    through), ``record_nullsafe`` (dicts plus ``null`` elements),
+    ``record_coerce`` (dicts needing string coercion), ``value_fast`` /
+    ``value_coerce`` (non-object roots wrapped in a synthetic ``value`` column).
+    """
+    kinds = root_items.kinds - {"null"}
+    has_null_elem = "null" in root_items.kinds
+    is_record_list = (
+        kinds == {"object"} and bool(root_items.fields) and not root_items.deep
+    )
+    plan = _resolve(root_items)
+    if is_record_list:
+        schema = _struct_plan_to_schema(plan)
+        if plan.dirty:
+            mode = "record_coerce"
+        elif has_null_elem:
+            mode = "record_nullsafe"
+        else:
+            mode = "record_fast"
+    else:
+        # Heterogeneous / primitive / array root -> single "value" column.
+        schema = pa.schema([pa.field("value", plan.dtype, nullable=True)])
+        mode = "value_coerce" if plan.dirty else "value_fast"
+    return plan, schema, mode
+
+
+def _chunk_to_batch(
+    chunk: list, plan: _Plan, mode: str, schema: pa.Schema
+) -> pa.RecordBatch:
+    """Turn decoded elements into one Arrow ``RecordBatch``.
+
+    Record modes go through ``from_pylist``; a ``null`` element in an
+    otherwise-object array becomes an all-null row (``{}``) because
+    ``from_pylist`` cannot take a bare ``None`` for a struct.  Value-wrapped
+    modes build the single ``value`` column directly with ``pa.array``
+    instead of allocating a ``{"value": ...}`` dict per element.
+    """
+    if mode == "record_fast":
+        rows = chunk
+    elif mode == "record_nullsafe":
+        rows = [r if type(r) is dict else {} for r in chunk]
+    elif mode == "record_coerce":
+        rows = [_coerce(r, plan) if type(r) is dict else {} for r in chunk]
+    else:
+        if mode == "value_coerce":
+            chunk = [_coerce(el, plan) for el in chunk]
+        arr = pa.array(chunk, type=schema.types[0])
+        return pa.RecordBatch.from_arrays([arr], schema=schema)
+    return pa.RecordBatch.from_pylist(rows, schema=schema)
+
+
 def _build_from_record(record: dict, max_depth: int) -> pa.Table:
     root = _Node()
     _accumulate(root, record, max_depth)
@@ -332,26 +400,71 @@ def _build_from_list(data: list, max_depth: int) -> pa.Table:
     root_items = _Node()
     for el in data:
         _accumulate(root_items, el, max_depth)
+    plan, schema, mode = _list_schema(root_items)
+    batch = _chunk_to_batch(data, plan, mode, schema)
+    return pa.Table.from_batches([batch], schema)
 
-    kinds = root_items.kinds - {"null"}
-    is_record_list = (
-        kinds == {"object"} and bool(root_items.fields) and not root_items.deep
-    )
 
-    if is_record_list:
-        plan = _resolve(root_items)
-        schema = _struct_plan_to_schema(plan)
-        if plan.dirty:
-            rows = [_coerce(r, plan) if type(r) is dict else None for r in data]
-        else:
-            rows = data
-        return pa.Table.from_pylist(rows, schema=schema)
+def build_arrow_table_streaming(
+    raw: bytes | str,
+    max_depth: int = DEFAULT_MAX_DEPTH,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    sample_limit: int = 1000,
+) -> tuple[pa.Table, list]:
+    """
+    Build a lossless Arrow table from the raw bytes of a **JSON array** without
+    ever holding the whole decoded object graph in memory.
 
-    # Heterogeneous / primitive / array root -> single "value" column.
-    plan = _resolve(root_items)
-    schema = pa.schema([pa.field("value", plan.dtype, nullable=True)])
-    if plan.dirty:
-        rows = [{"value": _coerce(el, plan)} for el in data]
+    Two passes over the source (see :mod:`jsonflux.core.streaming`), each
+    decoding one element at a time and dropping it:
+
+    1. fold every element into the type model, keeping the first
+       ``sample_limit`` elements aside for the display schema/examples;
+    2. build the Arrow table one ``chunk_size``-element ``RecordBatch`` at a
+       time.
+
+    Peak memory is therefore ``source text + one chunk + final Arrow table``
+    rather than ``full Python graph + Arrow table``.
+
+    Args:
+        raw: JSON source whose root is an array (caller guarantees this).
+            Pass ``str`` when the text is already decoded — it lets the caller
+            drop its byte copy so only one copy of the source stays resident.
+        max_depth: structural depth before collapsing to JSON strings.
+        chunk_size: elements accumulated per Arrow ``RecordBatch``.
+        sample_limit: how many leading elements to retain for the display schema.
+
+    Returns:
+        ``(table, sample_elements)`` — the sample list feeds the existing
+        sampled display-schema pipeline so ingestion memory drops without
+        changing what the LLM sees.
+    """
+    keep = sample_limit if sample_limit and sample_limit > 0 else 0
+    text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+
+    # Pass 1: type model + a bounded head sample.
+    root_items = _Node()
+    sample_elems: list = []
+    for el in iter_elements(text):
+        _accumulate(root_items, el, max_depth)
+        if len(sample_elems) < keep:
+            sample_elems.append(el)
+
+    plan, schema, mode = _list_schema(root_items)
+
+    # Pass 2: build Arrow one chunk at a time, dropping each chunk as we go.
+    batches: list[pa.RecordBatch] = []
+    buf: list = []
+    for el in iter_elements(text):
+        buf.append(el)
+        if len(buf) >= chunk_size:
+            batches.append(_chunk_to_batch(buf, plan, mode, schema))
+            buf = []
+    if buf:
+        batches.append(_chunk_to_batch(buf, plan, mode, schema))
+
+    if batches:
+        table = pa.Table.from_batches(batches, schema)
     else:
-        rows = [{"value": el} for el in data]
-    return pa.Table.from_pylist(rows, schema=schema)
+        table = pa.Table.from_pylist([], schema=schema)
+    return table, sample_elems

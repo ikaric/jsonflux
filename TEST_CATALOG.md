@@ -1,12 +1,24 @@
 # Test Suite
 
-**100 tests | all passing | ~4.6s runtime**
+**301 tests | all passing | ~4.5s runtime**
 
 ```
-============================= 100 passed in 4.61s ==============================
+============================= 301 passed in 4.51s ==============================
 ```
 
 Tests run against a deterministic generated dataset (seed=42) containing 1,000 products, 5,000 customers, 15,000 orders, and 7,500 reviews with deeply nested fields, arrays, and nullable values.
+
+## Test Modules
+
+| Module | Tests | Coverage |
+|--------|-------|----------|
+| `test_jsonflux.py` | 103 | Core analysis, SQL querying, formats, prompt generation (catalogued in detail below) |
+| `test_security.py` | 85 | Sandbox (filesystem/network/extensions), read-only mode, result caps, timeouts, identifier injection |
+| `test_streaming.py` | 42 | Streaming ingestion: element iterator strictness, streaming/bulk equivalence (incl. fuzz), thresholds |
+| `test_inference.py` | 39 | Lossless Arrow schema inference: type widening, conflicts, overflow, depth limits |
+| `test_performance.py` | 32 | Throughput and memory regression checks |
+
+The detailed catalog below covers the core `test_jsonflux.py` suite.
 
 ---
 

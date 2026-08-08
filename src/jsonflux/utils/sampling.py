@@ -20,9 +20,11 @@ class ReservoirSampler:
         if len(samples) < k:
             samples.append(v)
             return
-        j = self.rng.randint(1, n)
-        if j <= k:
-            samples[j - 1] = v
+        # Algorithm R accept test.  random() is several times cheaper than
+        # randint() and this line runs once per element past the first k.
+        j = int(self.rng.random() * n)
+        if j < k:
+            samples[j] = v
 
     def get_exact_k(self) -> list[Any]:
         k = self.k
