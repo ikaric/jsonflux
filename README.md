@@ -2,7 +2,7 @@
 
 # 📊 JSONFlux
 
-**High-performance JSON structure analysis and SQL querying for Python**
+**Let a small model filter a big API response — without pasting it into the context window or running generated code**
 
 [![PyPI](https://img.shields.io/pypi/v/jsonflux?color=306998&logo=pypi&logoColor=white)](https://pypi.org/project/jsonflux/)
 [![Python](https://img.shields.io/badge/Python-3.9+-3776AB?logo=python&logoColor=white)](https://python.org)
@@ -13,8 +13,9 @@
 [![PyArrow](https://img.shields.io/badge/PyArrow-Zero%20Copy-E34F26)](https://arrow.apache.org/docs/python/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-*Analyze JSON structure, visualize schemas, and query with SQL — all in one library.*
+*Turn a JSON payload into a compact schema a model can read, and a sandbox its SQL can't escape.*
 
+[Why This Exists](#-why-this-exists) •
 [Quick Start](#-quick-start) •
 [Structure Analysis](#-structure-analysis) •
 [SQL Queries](#-sql-queries) •
@@ -25,24 +26,53 @@
 
 ---
 
+## 🎯 Why This Exists
+
+You call an API. It returns 7 MB of nested JSON. You need the model to pull three rows out of it.
+
+The usual options are both bad:
+
+1. **Paste the payload into the context window.** It may not fit, you pay for every token, and a small model's accuracy degrades sharply as you bury the answer in noise.
+2. **Have the model write and execute filtering code.** Now you are running generated Python against your machine, and you own every consequence of that.
+
+JSONFlux is the third option. It reads the payload once and hands the model a **schema instead of the data** — table names, field paths, types, nullability, and a few real sample values, neatly formatted and small enough to sit in any context window. The model writes SQL against that schema. The SQL runs in a DuckDB connection that is locked down before it ever sees a query: no filesystem, no network, no extensions, no writes.
+
+> The USGS earthquake feed used in the tests below is **7.3 MB / 10,741 records**. `generate_prompt()` describes it in **~3,400 characters (roughly 900 tokens)** — about 0.05% of the raw payload, with every field name and type the model needs to query it correctly.
+
+**This is built for small, cheap, local models.** The schema is deliberately flat and explicitly typed because that is what a weak model needs to produce correct SQL — not because a frontier model couldn't infer it. Structure is presented once, plainly, so the model spends its capacity on the query rather than on guessing the shape of your data.
+
+### When you *don't* need this
+
+Be honest about the alternative: if you are writing the SQL yourself, or a frontier model is, and you trust the query, then DuckDB already does this in one line:
+
+```sql
+SELECT * FROM read_json_auto('data.json');
+```
+
+JSONFlux earns its place when **the SQL author is small, cheap, or untrusted** — and when you would rather not find out what a hallucinated query does to a database connection with filesystem access. It is also a genuinely useful inspection tool on its own: `read_json_auto` samples and coerces, while JSONFlux scans every value and reports union types (`mag: int | float`), nullability (`alert: str?`), and per-field statistics.
+
+---
+
 ## ✨ Features
 
 | Feature | Description |
 |---------|-------------|
-| 🔒 **Sandboxed by Default** | SQL runs in a locked-down DuckDB — no filesystem, network, or extensions |
-| 🎯 **Lossless Ingestion** | Every row and field is scanned; no dropped keys, no truncated values |
-| 🔍 **Structure Analysis** | Analyze JSON to reveal types, nesting, and patterns |
+| 🔒 **Sandboxed by Default** | SQL runs in a locked-down DuckDB — no filesystem, network, extensions, or writes. Safe to point generated queries at. |
+| 🤖 **Built for Small Models** | Flat, explicitly-typed schemas and pre-formatted prompts, so a weak model gets the query right |
+| 🪶 **Context-Window Friendly** | Megabytes of JSON become a few hundred tokens of schema — the data never enters the prompt |
+| 🎯 **Lossless Ingestion** | Every row and field is scanned; no dropped keys, no truncated values, no sampled guesses |
+| 🔍 **Structure Analysis** | Union types, nullability, nesting, and patterns — what `read_json_auto` won't tell you |
 | 🌳 **Tree Visualization** | Multiple formats: tree, tabs, bracket, and compact schema |
 | 📊 **Statistics** | Comprehensive stats: counts, sizes, distributions, nulls |
-| 🔎 **SQL Queries** | Query JSON with full DuckDB SQL (JOINs, CTEs, window functions) |
+| 🔎 **SQL Queries** | Full DuckDB SQL (JOINs, CTEs, window functions) over nested JSON |
 | 🚀 **High Performance** | msgspec for parsing, Arrow for zero-copy data transfer |
-| 🤖 **LLM-Optimized** | Token-efficient schemas perfect for AI context |
 | 📁 **Multiple Sources** | Load from dicts, lists, strings, or files |
 
 ---
 
 ## 📑 Table of Contents
 
+- [Why This Exists](#-why-this-exists)
 - [Quick Start](#-quick-start)
 - [Security & Sandboxing](#-security--sandboxing)
 - [Lossless Ingestion](#-lossless-ingestion)
@@ -752,6 +782,8 @@ print(engine.explain("""
 ## 🤖 LLM Integration
 
 JSONFlux is designed with LLM workflows in mind, providing ready-to-use system prompts for SQL generation.
+
+The prompt is written for the weakest model you are likely to point at it. It states the schema explicitly rather than expecting the model to infer it, spells out the notation, and shows worked query patterns — which is what a small or local model needs to emit correct SQL on the first attempt. Any model in the example below can be swapped for a local one; nothing here assumes a frontier model.
 
 ### Quick Start: One-Shot SQL Generation
 

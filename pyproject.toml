@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "jsonflux"
 version = "1.0.1"
-description = "High-performance JSON structure analysis and SQL querying"
+description = "Compact JSON schemas and sandboxed SQL, so small models can filter big API responses safely"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
