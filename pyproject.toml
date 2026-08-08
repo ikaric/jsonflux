@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "jsonflux"
-version = "1.0.1"
+version = "1.0.2"
 description = "Compact JSON schemas and sandboxed SQL, so small models can filter big API responses safely"
 readme = "README.md"
 requires-python = ">=3.9"
