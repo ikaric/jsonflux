@@ -127,10 +127,19 @@ that is locked down at creation time:
 |-----------|--------|
 | `enable_external_access=false` | `read_csv`/`read_text`/`COPY`/`ATTACH`/`glob` over any local or remote path fail |
 | Extensions disabled | No `INSTALL`/`LOAD`, no autoload, no community extensions (blocks `httpfs` network access) |
-| `lock_configuration=true` | The settings above **cannot** be re-enabled by a later `SET`/`PRAGMA` |
-| `memory_limit` (default `2GB`) | Bounds runaway aggregations / cross joins |
+| `lock_configuration=true` | The settings above **cannot** be re-enabled by a later `SET`/`PRAGMA`/`RESET` |
+| **Read-only mode** (default) | Only `SELECT`/`EXPLAIN` run; `DROP`/`DELETE`/`INSERT`/`CREATE`/`ATTACH`/`COPY`/`SET` are rejected **at parse time** — hostile SQL can't drop your registered tables |
+| `memory_limit` (default `2GB`) | Bounds runaway aggregations / cross joins inside DuckDB |
 | `query_timeout` (default `30s`) | A pathological query is interrupted, not run to completion |
-| Table-name validation | Registered names must be plain SQL identifiers (no injection) |
+| **`max_result_rows`** (default `1M`) | Caps the Python-side result so a `LIMIT`-less `SELECT` can't OOM the host (DuckDB's `memory_limit` does **not** bound this) |
+| **`max_result_bytes`** (default `256MB`) | Backstops pathological giant-cell results (e.g. `repeat('x', 2e9)`), recursing into nested values |
+| Identifier validation | Registered / described table names must be plain SQL identifiers (no injection) |
+
+The read-only guard uses DuckDB's own parser (`extract_statements`), so comments,
+whitespace, and multi-statement SQL (`SELECT 1; DROP VIEW data`) can't smuggle a
+write past it. Complex reads — CTEs, window functions, subqueries, `UNNEST` — all
+still work. For intentionally large results, use `query_iter()` (streaming) or
+`query_arrow()` (columnar), which bypass the row cap safely.
 
 ```python
 from jsonflux import QueryEngine
@@ -164,11 +173,17 @@ engine = QueryEngine(
 engine = QueryEngine(security=SecurityConfig(
     allow_external_access=False,  # keep the filesystem/network locked (default)
     allow_extensions=False,       # keep extensions disabled (default)
+    read_only=True,               # only SELECT/EXPLAIN (default)
     memory_limit="1GB",
     threads=4,
     query_timeout=15.0,
     lock_configuration=True,      # freeze all of the above (default)
+    max_result_rows=1_000_000,    # cap Python-side result rows (default)
+    max_result_bytes=256 * 1024 * 1024,  # cap result payload bytes (default)
 ))
+
+# Opt in to writes/DDL when you trust the query author (sandbox still applies):
+writable = QueryEngine(read_only=False)
 
 # Opt in to filesystem access ONLY if you trust whoever writes the SQL:
 trusted = QueryEngine(allow_external_access=True)
@@ -1236,7 +1251,7 @@ print(f"Total: {timing['total_time']:.3f}s")
 
 ### QueryEngine Class
 
-**Constructor:** `QueryEngine(security=None, *, allow_external_access=None, memory_limit=None, query_timeout=None, max_depth=64, sample_scan_limit=1000)` — sandboxed by default; see [Security & Sandboxing](#-security--sandboxing).
+**Constructor:** `QueryEngine(security=None, *, allow_external_access=None, memory_limit=None, query_timeout=None, read_only=None, max_result_rows=…, max_depth=64, sample_scan_limit=1000)` — sandboxed and read-only by default; see [Security & Sandboxing](#-security--sandboxing).
 
 | Method | Description |
 |--------|-------------|
@@ -1262,10 +1277,18 @@ Sandbox and resource policy for the SQL engine. All defaults are the safe choice
 |--------|---------|-------------|
 | `allow_external_access` | `False` | Allow SQL filesystem/network access (`read_csv`, `COPY`, `ATTACH`, …) |
 | `allow_extensions` | `False` | Allow extension install/load (incl. community extensions) |
+| `read_only` | `True` | Accept only `SELECT`/`EXPLAIN`; reject writes/DDL/`SET` at parse time |
 | `memory_limit` | `"2GB"` | DuckDB memory cap (`None` = DuckDB default) |
 | `threads` | `None` | DuckDB worker threads (`None` = DuckDB default) |
 | `query_timeout` | `30.0` | Seconds before a running query is interrupted (`None` = no timeout) |
-| `lock_configuration` | `True` | Freeze the above so `SET`/`PRAGMA` can't loosen them at runtime |
+| `lock_configuration` | `True` | Freeze the above so `SET`/`PRAGMA`/`RESET` can't loosen them at runtime |
+| `max_result_rows` | `1_000_000` | Max rows a materialising query may return (`None` = no cap) |
+| `max_result_bytes` | `268_435_456` | Max string/blob payload bytes in a result (`None` = no cap) |
+
+Exceptions: a query exceeding the row/byte caps raises `ResultTooLargeError`; a
+non-read statement in read-only mode raises `ReadOnlyViolationError`; a query
+past `query_timeout` raises `TimeoutError`. All three are exported from
+`jsonflux`.
 
 ### Output Formats
 
@@ -1301,13 +1324,13 @@ pip install -e ".[dev]"
 
 ### Testing
 
-The suite contains **206 tests** across four files:
+The suite contains **253 tests** across four files:
 
 | File | Tests | Focus |
 |------|-------|-------|
 | `test_jsonflux.py` | 100 | SQL fundamentals, JOINs, nested/UNNEST queries, LLM prompt generation |
 | `test_inference.py` | 39 | Every JSON type combination & conflict — lossless, crash-free ingestion |
-| `test_security.py` | 35 | Sandbox: filesystem/network/extension blocking, timeout, memory, injection |
+| `test_security.py` | 82 | Sandbox, read-only mode, result caps, timeout, memory, injection, creative file-write vectors |
 | `test_performance.py` | 32 | Caching, iterative merge, streaming, regression guards |
 
 `test_jsonflux.py` runs against a deterministic generated dataset (seed=42) with
