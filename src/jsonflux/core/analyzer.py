@@ -75,9 +75,9 @@ def merge_summary(a: Summary, b: Summary) -> Summary:
 
     _ALL = ALL_KINDS
 
-    def _merge_arr(a_arr: ArraySummary | None, b_arr: ArraySummary | None) -> tuple[
-        ArraySummary | None, list[tuple[Summary, Summary, dict, str]]
-    ]:
+    def _merge_arr(
+        a_arr: ArraySummary | None, b_arr: ArraySummary | None
+    ) -> tuple[ArraySummary | None, list[tuple[Summary, Summary, dict, str]]]:
         """Merge array metadata, returning the ArraySummary and deferred child merges."""
         if a_arr is None and b_arr is None:
             return None, []
@@ -120,9 +120,7 @@ def merge_summary(a: Summary, b: Summary) -> Summary:
     # Stack items: (a_node, b_node, target_dict, target_key)
     # target_dict[target_key] will be overwritten with the merged Summary.
     root_holder: dict[str, Summary] = {}
-    stack: list[tuple[Summary, Summary, dict, str]] = [
-        (a, b, root_holder, "_root")
-    ]
+    stack: list[tuple[Summary, Summary, dict, str]] = [(a, b, root_holder, "_root")]
 
     while stack:
         sa, sb, target, key = stack.pop()
