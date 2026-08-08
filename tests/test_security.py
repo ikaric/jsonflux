@@ -11,13 +11,25 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 
 import duckdb
 import pytest
 
-from jsonflux import JsonFlux, QueryEngine, SecurityConfig
+from jsonflux import (
+    JsonFlux,
+    QueryEngine,
+    ReadOnlyViolationError,
+    ResultTooLargeError,
+    SecurityConfig,
+)
 
 SAMPLE = [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+
+# A dangerous statement may be stopped either by the read-only guard (which runs
+# first, at parse time) or by the connection sandbox.  Tests that assert "this is
+# blocked" accept either -- the security property is what matters, not the layer.
+BLOCKED = (duckdb.Error, ReadOnlyViolationError)
 
 
 @pytest.fixture
@@ -67,13 +79,13 @@ def test_read_passwd_does_not_leak_content(engine):
 
 def test_copy_to_file_blocked(engine, tmp_path):
     target = tmp_path / "leak.csv"
-    with pytest.raises(duckdb.Error):
+    with pytest.raises(BLOCKED):
         engine.query(f"COPY (SELECT 1 AS x) TO '{target}' (FORMAT csv)")
     assert not target.exists()
 
 
 def test_export_database_blocked(engine, tmp_path):
-    with pytest.raises(duckdb.Error):
+    with pytest.raises(BLOCKED):
         engine.query(f"EXPORT DATABASE '{tmp_path}'")
     assert not any(os.scandir(tmp_path)) if tmp_path.exists() else True
 
@@ -94,7 +106,7 @@ def test_export_database_blocked(engine, tmp_path):
     ],
 )
 def test_extensions_and_attach_blocked(engine, sql):
-    with pytest.raises(duckdb.Error):
+    with pytest.raises(BLOCKED):
         engine.query(sql)
 
 
@@ -113,9 +125,10 @@ def test_extensions_and_attach_blocked(engine, sql):
     ],
 )
 def test_cannot_reenable_access(engine, sql):
-    with pytest.raises(duckdb.Error):
+    with pytest.raises(BLOCKED):
         engine.query(sql)
-    # And a read is still blocked afterwards.
+    # And a read is still blocked afterwards (SELECT passes the read-only guard
+    # and is stopped by the connection sandbox).
     with pytest.raises(duckdb.Error):
         engine.query("SELECT content FROM read_text('/etc/hostname')")
 
@@ -271,3 +284,287 @@ def test_connection_actually_locked():
             eng.conn.execute("SET enable_external_access=true")
     finally:
         eng.close()
+
+
+# ---------------------------------------------------------------------------
+# Creative file-write vectors (all rely on changing a locked setting)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # profiling output to a file
+        "PRAGMA enable_profiling='json'",
+        "SET profiling_output='/tmp/jf_pwn_prof.json'",
+        "PRAGMA profiling_output='/tmp/jf_pwn_prof.json'",
+        # spill / extension / secret / home directories
+        "SET temp_directory='/tmp/jf_pwn_tmp'",
+        "SET extension_directory='/tmp/jf_pwn_ext'",
+        "SET secret_directory='/tmp/jf_pwn_sec'",
+        "SET home_directory='/tmp'",
+        # casing / session variants must not bypass the lock
+        "set enable_external_access = true",
+        "SET SESSION enable_external_access=true",
+    ],
+)
+def test_locked_settings_and_file_write_vectors_blocked(engine, sql, tmp_path):
+    with pytest.raises(BLOCKED):
+        engine.query(sql)
+    # No stray files were produced under /tmp by the profiling/dir vectors.
+    assert not any(p.name.startswith("jf_pwn") for p in Path("/tmp").glob("jf_pwn*"))
+
+
+def test_reset_cannot_unlock(engine):
+    for sql in (
+        "RESET enable_external_access",
+        "RESET GLOBAL enable_external_access",
+    ):
+        with pytest.raises(BLOCKED):
+            engine.query(sql)
+    # Still blocked afterwards.
+    with pytest.raises(duckdb.Error):
+        engine.query("SELECT content FROM read_text('/etc/hostname')")
+
+
+def test_persistent_secret_blocked(engine):
+    with pytest.raises(BLOCKED):
+        engine.query("CREATE PERSISTENT SECRET s (TYPE s3, KEY_ID 'a', SECRET 'b')")
+
+
+def test_multi_statement_stays_sandboxed(engine, tmp_path):
+    target = tmp_path / "multi.csv"
+    with pytest.raises(BLOCKED):
+        engine.query(f"SELECT 1; COPY (SELECT 1 x) TO '{target}' (FORMAT csv)")
+    assert not target.exists()
+    with pytest.raises(BLOCKED):
+        engine.query("SELECT 1; INSTALL httpfs")
+
+
+def test_getenv_not_available(engine):
+    with pytest.raises(duckdb.Error):
+        engine.query("SELECT getenv('HOME')")
+
+
+# ---------------------------------------------------------------------------
+# Result-size caps (Python-side OOM guards)
+# ---------------------------------------------------------------------------
+
+
+def test_row_cap_rejects_huge_result():
+    eng = QueryEngine(max_result_rows=10_000).register("data", SAMPLE)
+    try:
+        with pytest.raises(ResultTooLargeError):
+            eng.query("SELECT i FROM range(1000000) t(i)")
+        # A result within the cap is fine.
+        assert len(eng.query("SELECT i FROM range(5000) t(i)")) == 5000
+    finally:
+        eng.close()
+
+
+def test_row_cap_boundary():
+    eng = QueryEngine(max_result_rows=100).register("data", SAMPLE)
+    try:
+        assert len(eng.query("SELECT i FROM range(100) t(i)")) == 100
+        with pytest.raises(ResultTooLargeError):
+            eng.query("SELECT i FROM range(101) t(i)")
+    finally:
+        eng.close()
+
+
+def test_row_cap_disabled():
+    eng = QueryEngine(
+        security=SecurityConfig(max_result_rows=None, max_result_bytes=None)
+    ).register("data", SAMPLE)
+    try:
+        assert len(eng.query("SELECT i FROM range(50000) t(i)")) == 50000
+    finally:
+        eng.close()
+
+
+def test_byte_cap_rejects_giant_cell():
+    eng = QueryEngine(security=SecurityConfig(max_result_bytes=10_000_000)).register(
+        "data", SAMPLE
+    )
+    try:
+        with pytest.raises(ResultTooLargeError):
+            eng.query("SELECT repeat('x', 50000000) AS s")
+    finally:
+        eng.close()
+
+
+def test_byte_cap_catches_giant_cell_hidden_in_list():
+    eng = QueryEngine(security=SecurityConfig(max_result_bytes=10_000_000)).register(
+        "data", SAMPLE
+    )
+    try:
+        with pytest.raises(ResultTooLargeError):
+            eng.query("SELECT [repeat('x', 50000000)] AS lst")
+    finally:
+        eng.close()
+
+
+def test_byte_cap_ignores_numeric_results():
+    # A large numeric result under the row cap must not trip the byte cap.
+    eng = QueryEngine(security=SecurityConfig(max_result_bytes=1024)).register(
+        "data", SAMPLE
+    )
+    try:
+        assert len(eng.query("SELECT i FROM range(5000) t(i)")) == 5000
+    finally:
+        eng.close()
+
+
+def test_caps_apply_to_execute_query_and_format_query():
+    eng = QueryEngine(max_result_rows=100).register("data", SAMPLE)
+    try:
+        # execute_query catches and reports the error rather than raising.
+        res = eng.execute_query("SELECT i FROM range(1000) t(i)")
+        assert res.success is False
+        assert "cap" in (res.error or "").lower()
+        # format_query returns an ERROR: string.
+        out = eng.format_query("SELECT i FROM range(1000) t(i)")
+        assert out.startswith("ERROR:")
+    finally:
+        eng.close()
+
+
+def test_streaming_escape_hatches_bypass_row_cap():
+    eng = QueryEngine(max_result_rows=1000).register("data", SAMPLE)
+    try:
+        # query_iter streams and is memory-bounded per batch.
+        n = sum(1 for _ in eng.query_iter("SELECT i FROM range(50000) t(i)"))
+        assert n == 50000
+        # query_arrow returns a columnar reader.
+        reader = eng.query_arrow("SELECT i FROM range(50000) t(i)")
+        tbl = reader.read_all() if hasattr(reader, "read_all") else reader
+        assert tbl.num_rows == 50000
+    finally:
+        eng.close()
+
+
+# ---------------------------------------------------------------------------
+# Identifier injection defence beyond register()
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_table",
+    [
+        "data; SELECT 1",
+        "(SELECT secret FROM data)",
+        "data--",
+        "data'",
+    ],
+)
+def test_schema_rejects_identifier_injection(bad_table):
+    eng = QueryEngine().register("data", [{"id": 1, "secret": "hunter2"}])
+    try:
+        with pytest.raises(ValueError):
+            eng.schema(bad_table)
+        # The legit call still works.
+        assert "id" in eng.schema("data")
+    finally:
+        eng.close()
+
+
+def test_security_config_result_caps_defaults():
+    cfg = SecurityConfig()
+    assert cfg.max_result_rows == 1_000_000
+    assert cfg.max_result_bytes == 256 * 1024 * 1024
+
+
+# ---------------------------------------------------------------------------
+# Read-only mode (defense-in-depth: blocks writes/DDL at parse time)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "DROP VIEW data",
+        "DELETE FROM data",
+        "UPDATE data SET name='x'",
+        "INSERT INTO data VALUES (9, 'x')",
+        "CREATE TABLE t2 (i INT)",
+        "CREATE VIEW v AS SELECT 1",
+        "ALTER TABLE data ADD COLUMN c INT",
+        "ATTACH ':memory:' AS m",
+        "SET memory_limit='9GB'",
+        "PREPARE p AS SELECT 1",
+        "SELECT 1; DROP VIEW data",  # multi-statement can't smuggle a write
+    ],
+)
+def test_read_only_blocks_non_reads(engine, sql):
+    with pytest.raises(ReadOnlyViolationError):
+        engine.query(sql)
+
+
+def test_read_only_preserves_registered_data():
+    """The DROP VIEW griefing vector: hostile SQL must not nuke the table."""
+    eng = QueryEngine().register("data", SAMPLE)
+    try:
+        with pytest.raises(ReadOnlyViolationError):
+            eng.query("DROP VIEW data")
+        # Table is intact and still queryable.
+        assert eng.query("SELECT count(*) AS c FROM data")[0]["c"] == 2
+    finally:
+        eng.close()
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM data",
+        "WITH t AS (SELECT * FROM data) SELECT count(*) AS c FROM t",
+        "SELECT id, row_number() OVER (ORDER BY id) AS rn FROM data",
+        "EXPLAIN SELECT * FROM data",
+        "SELECT * FROM data WHERE id IN (SELECT id FROM data WHERE id > 0)",
+    ],
+)
+def test_read_only_allows_complex_reads(engine, sql):
+    # Should not raise (EXPLAIN returns plan rows; the rest return data).
+    engine.query(sql)
+
+
+def test_read_only_applies_to_all_query_methods():
+    eng = QueryEngine().register("data", SAMPLE)
+    try:
+        with pytest.raises(ReadOnlyViolationError):
+            list(eng.query_iter("DROP VIEW data"))
+        with pytest.raises(ReadOnlyViolationError):
+            eng.query_arrow("DROP VIEW data")
+        with pytest.raises(ReadOnlyViolationError):
+            eng.execute("DROP VIEW data")
+        # execute_query / format_query surface it as an error result/string.
+        assert eng.execute_query("DROP VIEW data").success is False
+        assert eng.format_query("DROP VIEW data").startswith("ERROR:")
+    finally:
+        eng.close()
+
+
+def test_read_only_opt_out_allows_ddl_but_keeps_sandbox():
+    eng = QueryEngine(read_only=False).register("data", SAMPLE)
+    try:
+        # DDL now works...
+        eng.query("CREATE TEMP TABLE t AS SELECT 1 AS x")
+        assert eng.query("SELECT x FROM t") == [{"x": 1}]
+        # ...but the connection sandbox still blocks the filesystem.
+        with pytest.raises(duckdb.Error):
+            eng.query("SELECT content FROM read_text('/etc/passwd')")
+        # ...and the config is still locked even with writes allowed.
+        with pytest.raises(duckdb.Error):
+            eng.query("SET enable_external_access=true")
+    finally:
+        eng.close()
+
+
+def test_read_only_default_true():
+    assert SecurityConfig().read_only is True
+
+
+def test_jsonflux_query_is_read_only():
+    flux = JsonFlux().analyze({"rows": [{"id": 1}]})
+    with pytest.raises(ReadOnlyViolationError):
+        flux.query("DROP VIEW data")
+    flux.close()

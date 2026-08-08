@@ -37,7 +37,12 @@ from .core.stats import (
 from .core.stats import (
     collect_stats as collect_stats_fn,
 )
-from .query.engine import QueryEngine, QueryResult
+from .query.engine import (
+    QueryEngine,
+    QueryResult,
+    ReadOnlyViolationError,
+    ResultTooLargeError,
+)
 from .query.security import SecurityConfig
 from .utils.sampling import ReservoirSampler
 
@@ -71,6 +76,8 @@ __all__ = [
     "ReservoirSampler",
     "QueryEngine",
     "QueryResult",
+    "ReadOnlyViolationError",
+    "ResultTooLargeError",
     "SecurityConfig",
     # Utility functions
     "kind_of",

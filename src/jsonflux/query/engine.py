@@ -41,6 +41,97 @@ class QueryResult(msgspec.Struct, gc=False):
     """First N rows as markdown table when split is requested, None otherwise."""
 
 
+class ResultTooLargeError(Exception):
+    """Raised when a materialised query result exceeds the engine's caps.
+
+    This bounds Python-side memory: DuckDB's ``memory_limit`` governs DuckDB,
+    not the row list / dict result built in Python, so an unbounded ``SELECT``
+    could otherwise exhaust host memory.
+    """
+
+
+class ReadOnlyViolationError(Exception):
+    """Raised in read-only mode when SQL contains a non-read statement.
+
+    Defense-in-depth on top of the connection sandbox: it stops hostile SQL
+    from dropping registered tables or mutating session state before the
+    statement ever reaches DuckDB.
+    """
+
+
+# Statement types permitted in read-only mode.  DuckDB parses read-only
+# ``PRAGMA``/``CALL`` introspection (e.g. ``PRAGMA version``) as SELECT, so the
+# set stays tight: only genuine reads and non-executing EXPLAIN.
+_READONLY_ALLOWED = frozenset({"SELECT", "EXPLAIN"})
+
+
+def _cell_bytes(v: Any) -> int:
+    """Approximate the payload size of a result cell, recursing into containers
+    so a large string cannot hide inside a list/struct."""
+    t = type(v)
+    if t is str or t is bytes or t is bytearray:
+        return len(v)
+    if t is list or t is tuple:
+        total = 0
+        for x in v:
+            total += _cell_bytes(x)
+        return total
+    if t is dict:
+        total = 0
+        for k, x in v.items():
+            if type(k) is str:
+                total += len(k)
+            total += _cell_bytes(x)
+        return total
+    return 0
+
+
+def _scannable_column_indices(description: Any) -> list[int]:
+    """Column indices whose type can hold a large payload (strings, blobs, and
+    nested containers).  Purely fixed-width numeric/temporal columns are skipped
+    so numeric aggregations pay no byte-scan cost."""
+    idx: list[int] = []
+    for i, col in enumerate(description):
+        t = str(col[1]).upper()
+        if (
+            "CHAR" in t
+            or "BLOB" in t
+            or "TEXT" in t
+            or "JSON" in t
+            or "[" in t
+            or "STRUCT" in t
+            or "MAP" in t
+            or "UNION" in t
+            or "LIST" in t
+        ):
+            idx.append(i)
+    return idx
+
+
+def _enforce_byte_cap(
+    rows: list[tuple[Any, ...]], byte_cap: int, col_indices: list[int]
+) -> None:
+    """
+    Reject a result whose string/blob/nested payload exceeds ``byte_cap``.
+
+    Only ``col_indices`` (variable-length columns) are measured, and scanning
+    stops as soon as the budget is blown -- so numeric results and the common
+    small case are nearly free.
+    """
+    if not col_indices:
+        return
+    total = 0
+    for row in rows:
+        for i in col_indices:
+            total += _cell_bytes(row[i])
+        if total > byte_cap:
+            raise ResultTooLargeError(
+                f"Query result exceeds the {byte_cap:,}-byte cap. Narrow the "
+                "columns/rows selected, raise QueryEngine(security=SecurityConfig"
+                "(max_result_bytes=…)), or stream with query_iter()."
+            )
+
+
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -192,6 +283,8 @@ class QueryEngine:
         allow_external_access: bool | None = None,
         memory_limit: str | None = None,
         query_timeout: float | None = None,
+        read_only: bool | None = None,
+        max_result_rows: int | None = -1,
         max_depth: int = DEFAULT_MAX_DEPTH,
         sample_scan_limit: int = 1000,
     ):
@@ -213,6 +306,12 @@ class QueryEngine:
                 Ignored when ``security`` is provided.
             query_timeout: Convenience override for ``security.query_timeout``
                 (seconds).  Ignored when ``security`` is provided.
+            read_only: Convenience override for ``security.read_only``.  When
+                ``True`` (default) only SELECT/EXPLAIN reads are accepted.
+                Ignored when ``security`` is provided.
+            max_result_rows: Convenience override for
+                ``security.max_result_rows`` (``None`` disables the cap).
+                Ignored when ``security`` is provided.
             max_depth: Maximum JSON nesting depth modelled as typed columns
                 before deeper subtrees are stored as JSON strings.
             sample_scan_limit: Maximum number of top-level records scanned to
@@ -229,6 +328,12 @@ class QueryEngine:
                 security.memory_limit = memory_limit
             if query_timeout is not None:
                 security.query_timeout = query_timeout
+            if read_only is not None:
+                security.read_only = read_only
+            # -1 is the "not provided" sentinel because None is a valid value
+            # (it disables the row cap).
+            if max_result_rows != -1:
+                security.max_result_rows = max_result_rows
         self.security = security
         self.max_depth = max_depth
         self.sample_scan_limit = sample_scan_limit
@@ -391,24 +496,78 @@ class QueryEngine:
     def _timeout(self) -> float | None:
         return self.security.query_timeout
 
+    def _check_readonly(self, sql: str) -> None:
+        """
+        In read-only mode, reject any statement that is not a pure read.
+
+        Uses DuckDB's own parser (``extract_statements``) rather than string
+        matching, so comments, whitespace, and multi-statement SQL cannot slip a
+        write past the check.  If parsing fails we let execution surface the
+        real syntax error.
+        """
+        if not self.security.read_only:
+            return
+        try:
+            statements = self.conn.extract_statements(sql)
+        except Exception:
+            return
+        for stmt in statements:
+            type_name = str(stmt.type).rsplit(".", 1)[-1]
+            if type_name not in _READONLY_ALLOWED:
+                raise ReadOnlyViolationError(
+                    f"Statement type {type_name} is not allowed in read-only "
+                    "mode. Only SELECT/EXPLAIN reads are permitted; construct "
+                    "the engine with read_only=False (or "
+                    "SecurityConfig(read_only=False)) to allow writes/DDL."
+                )
+
     def _fetch(self, sql: str) -> tuple[list[str], list[tuple[Any, ...]]]:
         """
-        Execute ``sql`` and fully materialise its rows under the query timeout.
+        Execute ``sql`` and materialise its rows under the query timeout and
+        result-size caps.
 
         Returns ``(columns, rows)``.  The interrupt watchdog stays armed
-        through ``fetchall()`` because DuckDB executes lazily -- the real work
+        through the fetch because DuckDB executes lazily -- the real work
         happens during the fetch, not the ``execute`` call.
+
+        Raises:
+            TimeoutError: if the query exceeds ``query_timeout``.
+            ResultTooLargeError: if the result exceeds ``max_result_rows`` or
+                ``max_result_bytes``.  DuckDB's ``memory_limit`` bounds DuckDB,
+                not the Python list we build here, so these caps are what stop
+                a ``LIMIT``-less query from OOM-ing the host.
         """
+        self._check_readonly(sql)
+        row_cap = self.security.max_result_rows
+        byte_cap = self.security.max_result_bytes
         try:
             with interrupt_after(self.conn, self._timeout()):
                 result = self.conn.execute(sql)
-                columns = [desc[0] for desc in result.description]
-                rows = result.fetchall()
-            return columns, rows
+                description = result.description
+                columns = [desc[0] for desc in description]
+                if row_cap is None:
+                    rows = result.fetchall()
+                else:
+                    # Fetch at most one row beyond the cap: bounds the number of
+                    # rows pulled into Python before we can reject an oversized
+                    # result.
+                    rows = result.fetchmany(row_cap + 1)
         except duckdb.InterruptException as e:
             raise TimeoutError(
                 f"Query exceeded the {self._timeout()}s timeout and was cancelled."
             ) from e
+
+        if row_cap is not None and len(rows) > row_cap:
+            raise ResultTooLargeError(
+                f"Query returned more than the {row_cap:,}-row cap. Add a LIMIT "
+                "or aggregate, raise QueryEngine(max_result_rows=…), or use "
+                "query_iter()/query_arrow() for large results."
+            )
+
+        if byte_cap is not None:
+            _enforce_byte_cap(rows, byte_cap, _scannable_column_indices(description))
+
+        return columns, rows
 
     def query(self, sql: str) -> list[dict[str, Any]]:
         """Execute SQL query and return results as list of dicts."""
@@ -433,6 +592,7 @@ class QueryEngine:
         Yields:
             dict for each result row
         """
+        self._check_readonly(sql)
         timeout = self._timeout()
         try:
             with interrupt_after(self.conn, timeout):
@@ -452,6 +612,7 @@ class QueryEngine:
 
     def query_arrow(self, sql: str):
         """Execute SQL and return as PyArrow Table."""
+        self._check_readonly(sql)
         try:
             with interrupt_after(self.conn, self._timeout()):
                 return self.conn.execute(sql).arrow()
@@ -469,6 +630,7 @@ class QueryEngine:
         subsequent fetches.  Use :meth:`query`/:meth:`execute_query` for
         timeout-guarded materialisation.
         """
+        self._check_readonly(sql)
         with interrupt_after(self.conn, self._timeout()):
             return self.conn.execute(sql)
 
@@ -490,6 +652,9 @@ class QueryEngine:
 
     def schema(self, table: str) -> str:
         """Show schema of a table."""
+        # ``table`` is interpolated into SQL; require a plain identifier so this
+        # cannot be used to smuggle a subquery or a second statement.
+        _validate_identifier(table)
         result = self.conn.execute(f"DESCRIBE {table}").fetchall()
         lines = [f"Schema of '{table}':"]
         for row in result:
