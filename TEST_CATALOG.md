@@ -1,9 +1,9 @@
 # Test Suite
 
-**301 tests | all passing | ~4.5s runtime**
+**319 tests | all passing | ~5.5s runtime**
 
 ```
-============================= 301 passed in 4.51s ==============================
+============================= 319 passed in 5.62s ==============================
 ```
 
 Tests run against a deterministic generated dataset (seed=42) containing 1,000 products, 5,000 customers, 15,000 orders, and 7,500 reviews with deeply nested fields, arrays, and nullable values.
@@ -17,6 +17,7 @@ Tests run against a deterministic generated dataset (seed=42) containing 1,000 p
 | `test_streaming.py` | 42 | Streaming ingestion: element iterator strictness, streaming/bulk equivalence (incl. fuzz), thresholds |
 | `test_inference.py` | 39 | Lossless Arrow schema inference: type widening, conflicts, overflow, depth limits |
 | `test_performance.py` | 32 | Throughput and memory regression checks |
+| `test_llm_schema.py` | 18 | LLM-facing schema fidelity: nullable samples, de-duplicated samples, complete value sets for categorical fields, ISO-date tagging, quoting of reserved/special keys, 1-based indexing guidance, every example query in the generated prompt executes |
 
 The detailed catalog below covers the core `test_jsonflux.py` suite.
 

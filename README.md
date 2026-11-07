@@ -365,8 +365,8 @@ print(flux.tree())
 ```
 <root>
 ├── metadata
-│   ├── count: int samples=[2, 2]
-│   └── version: str samples=["1.0", "1.0"]
+│   ├── count: int samples=[2]
+│   └── version: str samples=["1.0"]
 └── users
     └── object [2]
         ├── id: int samples=[1, 2]
@@ -1083,6 +1083,33 @@ print(flux.tree(format="schema"))
   }]
 }
 ```
+
+### What the Schema Tells the Model
+
+`describe_tables()` and `generate_prompt()` render a few things explicitly,
+because they are exactly where models otherwise guess wrong:
+
+```typescript
+[{
+  created_at: str (ISO date) samples=["2025-04-17", "2025-09-16", "2025-01-10"]
+  status: str one of ["cancelled", "delivered", "pending"]
+  coords: [float samples=[43.07, 43.55, 18.4]]
+  felt: int? samples=[429, 53, 441]
+  "end": {
+    station: str one of ["Bascarsija", "Otoka"]
+  }
+}]
+```
+
+| Rendering | Meaning |
+|---|---|
+| `one of [...]` | The complete value set of a categorical string field, so filters use the stored value (`'cancelled'`, not `'canceled'`). Shown for fields with at most `enum_max` (default 12) repeating values; `e.g. one of` when only a sample of a large input was scanned. `enum_max=0` turns it off. |
+| `str (ISO date)` | Dates stored as text. String comparison works; date functions need `CAST(col AS DATE)`. |
+| `int?` with samples | Nullable fields keep their (non-null) examples. |
+| `"end": {...}` | Keys that are SQL reserved words or contain special characters are shown quoted, exactly as SQL must spell them (`"end".station`). The prompt's example queries quote them too. |
+
+Samples are de-duplicated, and the prompt notes that DuckDB lists are 1-based
+(`coords[1]` is the first element).
 
 ### SQL Query Patterns for LLMs
 
