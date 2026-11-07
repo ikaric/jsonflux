@@ -17,6 +17,7 @@ from ..core.infer import (
 )
 from ..core.streaming import first_nonws_char, looks_like_array
 from ..utils.sampling import ReservoirSampler
+from ..utils.sql import quote_ident
 from .security import SecurityConfig, interrupt_after
 
 # --------------------------
@@ -471,6 +472,7 @@ class QueryEngine:
         else:
             sample_rows = summary_source
         analyzer.collect_samples(sample_rows, sample_store, k=3, rng=rng)
+        samples_exhaustive = sample_rows is summary_source
 
         self.tables[name] = {
             "source": source_desc,
@@ -480,6 +482,7 @@ class QueryEngine:
             "value_wrapped": value_wrapped,
             "summary": summary,
             "sample_store": sample_store,
+            "samples_exhaustive": samples_exhaustive,
             "description": description,
         }
         # raw `data` is NOT stored — Arrow table in DuckDB is the only copy
@@ -701,7 +704,10 @@ class QueryEngine:
         self._check_readonly(sql)
         try:
             with interrupt_after(self.conn, self._timeout()):
-                return self.conn.execute(sql).arrow()
+                result = self.conn.execute(sql)
+                # DuckDB 2.0 renamed ``arrow()`` to ``to_arrow_table()``.
+                to_table = getattr(result, "to_arrow_table", None) or result.arrow
+                return to_table()
         except duckdb.InterruptException as e:
             raise TimeoutError(
                 f"Query exceeded the {self._timeout()}s timeout and was cancelled."
@@ -780,6 +786,7 @@ class QueryEngine:
         samples: int | None = 3,
         max_sample_len: int = 60,
         max_schema_depth: int | None = 8,
+        enum_max: int = 12,
     ) -> str:
         """
         Generate table schemas section for LLM consumption.
@@ -791,6 +798,10 @@ class QueryEngine:
             max_schema_depth: Maximum nesting depth to render in schemas.
                 Structures deeper than this are collapsed to ``{...}`` /
                 ``[...]`` to save tokens.  ``None`` means unlimited.
+            enum_max: String fields with at most this many distinct,
+                repeating values are shown with their complete value set
+                (``one of [...]``) so a model uses the exact stored values.
+                0 disables.  Requires ``samples`` > 0.
 
         Returns:
             Markdown-formatted string describing all registered tables.
@@ -819,6 +830,8 @@ class QueryEngine:
                     max_sample_len=max_sample_len,
                     samples_k=samples_k,
                     max_depth=max_schema_depth,
+                    enum_max=enum_max,
+                    enum_exhaustive=info.get("samples_exhaustive", True),
                 )
                 lines.append("```typescript")
                 lines.append(schema_str)
@@ -895,6 +908,24 @@ class QueryEngine:
         )
         lines.append("- `field: str?` = nullable (may be null)")
         lines.append("- `[{...}]` = array of objects, `[str]` = array of strings")
+        if " one of [" in table_descriptions:
+            lines.append(
+                "- `one of [...]` = every value the field takes; filter with "
+                "these exact (case-sensitive) values"
+            )
+        if "(ISO date)" in table_descriptions:
+            lines.append(
+                "- `str (ISO date)` = date stored as text: compare as strings "
+                "(`col >= '2025-03-01'`), use `CAST(col AS DATE)` before "
+                "date functions like `month()`"
+            )
+        quoted = re.search(r'^\s*("[^"\n]+"): ', table_descriptions, re.M)
+        if quoted:
+            lines.append(
+                f'- `{quoted.group(1)}` = key that must be double-quoted in SQL '
+                f'(reserved word or special characters), e.g. '
+                f'`SELECT {quoted.group(1)} FROM ...`'
+            )
         if has_nested:
             # Use a real nested field for the dot notation example
             for tn, nl in all_nested.items():
@@ -904,7 +935,8 @@ class QueryEngine:
                     if subs:
                         lines.append(
                             f"- Nested objects use dot notation: "
-                            f"`{tn}.{nl[0]}.{subs[0]}`"
+                            f"`{quote_ident(tn)}.{quote_ident(nl[0])}."
+                            f"{quote_ident(subs[0])}`"
                         )
                     else:
                         lines.append(
@@ -926,9 +958,8 @@ class QueryEngine:
                 f1, f2 = flat[0], flat[1]
                 lines.append("### Basic Query")
                 lines.append("```sql")
-                lines.append(
-                    f"SELECT {f1[0]}, {f2[0]} FROM {tname} ORDER BY {f1[0]} LIMIT 10"
-                )
+                c1, c2, qt = quote_ident(f1[0]), quote_ident(f2[0]), quote_ident(tname)
+                lines.append(f"SELECT {c1}, {c2} FROM {qt} ORDER BY {c1} LIMIT 10")
                 lines.append("```\n")
                 break
 
@@ -945,7 +976,10 @@ class QueryEngine:
                         lines.append("### Nested Objects (Dot Notation)")
                         lines.append("Access nested fields with dots:")
                         lines.append("```sql")
-                        lines.append(f"SELECT {nfield}.{sf1} FROM {tname}")
+                        lines.append(
+                            f"SELECT {quote_ident(nfield)}.{quote_ident(sf1)} "
+                            f"FROM {quote_ident(tname)}"
+                        )
                         lines.append("```\n")
                     break
 
@@ -953,7 +987,8 @@ class QueryEngine:
         if has_arrays:
             for tname, arr_list in all_arrays.items():
                 if arr_list:
-                    arr_name, elem_kind = arr_list[0]
+                    raw_arr, elem_kind = arr_list[0]
+                    arr_name, tq = quote_ident(raw_arr), quote_ident(tname)
                     lines.append("### Arrays — CRITICAL")
                     lines.append(
                         "Array fields MUST be flattened with UNNEST "
@@ -962,25 +997,25 @@ class QueryEngine:
                     if elem_kind == "object":
                         # Get sub-fields of the array element
                         summary = self.tables[tname].get("summary")
-                        arr_subfields = self._get_array_subfields(summary, arr_name)
+                        arr_subfields = self._get_array_subfields(summary, raw_arr)
                         if arr_subfields:
-                            sf = arr_subfields[0]
+                            sf = quote_ident(arr_subfields[0])
                             lines.append("```sql")
                             lines.append(f"SELECT item.{sf}, COUNT(*) as cnt")
                             lines.append(
-                                f"FROM (SELECT unnest({arr_name}) as item FROM {tname})"
+                                f"FROM (SELECT unnest({arr_name}) as item FROM {tq})"
                             )
                             lines.append(f"GROUP BY item.{sf}")
                             lines.append("```\n")
                         else:
                             lines.append("```sql")
                             lines.append(
-                                f"SELECT unnest({arr_name}) as item FROM {tname}"
+                                f"SELECT unnest({arr_name}) as item FROM {tq}"
                             )
                             lines.append("```\n")
                     else:
                         lines.append("```sql")
-                        lines.append(f"SELECT unnest({arr_name}) as val FROM {tname}")
+                        lines.append(f"SELECT unnest({arr_name}) as val FROM {tq}")
                         lines.append("```\n")
 
                     # Wrong/right example
@@ -1112,7 +1147,7 @@ class QueryEngine:
             ex_arr = ""
             for tn, al in all_arrays.items():
                 if al:
-                    ex_tname, ex_arr = tn, al[0][0]
+                    ex_tname, ex_arr = quote_ident(tn), quote_ident(al[0][0])
                     break
             lines.append(
                 f"1. Forgetting UNNEST — array fields like `{ex_arr}` in "
@@ -1122,7 +1157,11 @@ class QueryEngine:
             lines.append(
                 "2. Missing alias after UNNEST — always write `unnest(col) as item`"
             )
-            lines.append("3. Using array indexing like `[0]` — use UNNEST instead")
+            lines.append(
+                "3. Indexing from 0 — DuckDB lists are 1-based: "
+                f"`{ex_arr}[1]` is the first element (`[0]` is NULL); "
+                "use UNNEST to aggregate over all elements"
+            )
         else:
             lines.append("1. If the data had array fields, they would require UNNEST")
         lines.append(
@@ -1173,6 +1212,7 @@ class QueryEngine:
         samples: int | None = 3,
         max_sample_len: int = 60,
         max_schema_depth: int | None = 8,
+        enum_max: int = 12,
     ) -> str:
         """
         Generate a complete system prompt for LLM SQL generation.
@@ -1187,6 +1227,8 @@ class QueryEngine:
             max_schema_depth: Maximum nesting depth for schemas (default 8).
                 Deeply nested structures beyond this limit are collapsed to
                 ``{...}`` / ``[...]`` to save tokens.
+            enum_max: Show the complete value set of string fields with at
+                most this many distinct values (see ``describe_tables``).
 
         Returns:
             Complete system prompt string ready to pass to an LLM.
@@ -1201,6 +1243,7 @@ class QueryEngine:
             samples=samples,
             max_sample_len=max_sample_len,
             max_schema_depth=max_schema_depth,
+            enum_max=enum_max,
         )
         return self._build_prompt(table_desc)
 

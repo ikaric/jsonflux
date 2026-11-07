@@ -8,6 +8,7 @@ from typing import Any
 import msgspec
 
 from ..utils.sampling import ReservoirSampler
+from ..utils.sql import quote_ident
 from .models import (
     ALL_KINDS,
     KIND_ORDER,
@@ -56,14 +57,41 @@ def samples_suffix(
     path: tuple[str, ...],
     max_sample_len: int,
     samples_k: int,
+    enum_max: int = 0,
+    enum_exhaustive: bool = True,
 ) -> str:
-    """Generate sample values suffix for tree labels."""
+    """Generate sample values suffix for tree labels.
+
+    Samples are de-duplicated (``["X"]`` rather than ``["X", "X", "X"]``).
+    With ``enum_max > 0``, a string field whose values repeat and number at
+    most ``enum_max`` is rendered with its complete value set instead
+    (``one of ["a", "b"]``); ``enum_exhaustive=False`` marks that set as
+    observed in a sample of the rows (``e.g. one of [...]``).  ISO date
+    strings are tagged ``(ISO date)``.
+    """
     if samples_k <= 0:
         return ""
     sampler = store.get(path)
-    vals = sampler.get_exact_k() if sampler else [None] * samples_k
+    if sampler is None:
+        return " samples=[null]"
+    date_tag = " (ISO date)" if sampler.dates and sampler.n_seen else ""
+    distinct = sampler.distinct
+    if (
+        enum_max > 0
+        and not date_tag
+        and distinct is not None
+        and 1 < len(distinct) <= enum_max
+        and sampler.n_seen >= 2 * len(distinct)
+    ):
+        label = "one of" if enum_exhaustive else "e.g. one of"
+        rendered = ", ".join(jsonish_sample(x, max_sample_len) for x in sorted(distinct))
+        return f" {label} [{rendered}]"
+    vals: list[Any] = []
+    for x in sampler.get_exact_k():
+        if x not in vals:
+            vals.append(x)
     rendered = ", ".join(jsonish_sample(x, max_sample_len) for x in vals)
-    return f" samples=[{rendered}]"
+    return f"{date_tag} samples=[{rendered}]"
 
 
 def merge_summary(a: Summary, b: Summary) -> Summary:
@@ -331,6 +359,10 @@ class Analyzer:
             v, path = stack.pop()
             t = _kind_of(v)
 
+            if t == "null":
+                # Nulls carry no information as examples; nullability is
+                # already rendered as ``type?``.
+                continue
             if t in _PRIMITIVE_KINDS:
                 if path and path[-1] == "<items>":
                     cache_key = (path, t)
@@ -560,6 +592,8 @@ def summary_to_schema(
     indent: int = 0,
     inline: bool = False,
     max_depth: int | None = None,
+    enum_max: int = 0,
+    enum_exhaustive: bool = True,
 ) -> str:
     """
     Convert Summary to compact TypeScript-like schema for LLM consumption.
@@ -613,7 +647,8 @@ def summary_to_schema(
             return ""
         # For array items, use the kind-specific path
         lookup_path = p + (f"<items:{kind}>",) if kind else p
-        return samples_suffix(sample_store, lookup_path, max_sample_len, samples_k)
+        return samples_suffix(sample_store, lookup_path, max_sample_len, samples_k,
+                              enum_max, enum_exhaustive)
 
     # Collect primitive types
     prim_types = [t for t in ("str", "int", "float", "bool", "null") if t in primitives]
@@ -635,8 +670,12 @@ def summary_to_schema(
                     indent + 1,
                     inline=True,
                     max_depth=max_depth,
+                    enum_max=enum_max,
+                    enum_exhaustive=enum_exhaustive,
                 )
-                fields.append(f"{key}: {child_schema}")
+                # Keys that are SQL reserved words (or contain special
+                # characters) are shown quoted, exactly as SQL must spell them.
+                fields.append(f"{quote_ident(key)}: {child_schema}")
 
             if inline and len(fields) <= 3 and all(len(f) < 30 for f in fields):
                 # Compact inline: {a: int, b: str}
@@ -673,6 +712,8 @@ def summary_to_schema(
                         indent,
                         inline=True,
                         max_depth=max_depth,
+                        enum_max=enum_max,
+                        enum_exhaustive=enum_exhaustive,
                     )
                     elem_types.append(elem_schema)
                 elif kind == "array" and kind in s_arr.kind_summaries:
@@ -685,6 +726,8 @@ def summary_to_schema(
                         indent,
                         inline=True,
                         max_depth=max_depth,
+                        enum_max=enum_max,
+                        enum_exhaustive=enum_exhaustive,
                     )
                     elem_types.append(elem_schema)
                 elif kind == "object":
@@ -698,6 +741,16 @@ def summary_to_schema(
                 parts.append(f"[{' | '.join(elem_types)}]")
             else:
                 parts.append("[]")
+
+    # Nullable leaf (one type + null): keep the samples, render as ``type?``.
+    if (
+        len(prim_types) == 2
+        and "null" in prim_types
+        and s_obj is None
+        and s_arr is None
+    ):
+        base = prim_types[0] if prim_types[1] == "null" else prim_types[1]
+        return f"{base}?{get_samples(path)}"
 
     # Add primitive types with samples
     if prim_types:
@@ -735,6 +788,8 @@ def render_schema(
     max_sample_len: int = 60,
     samples_k: int = 0,
     max_depth: int | None = None,
+    enum_max: int = 0,
+    enum_exhaustive: bool = True,
 ) -> str:
     """
     Render a compact schema from the root Summary.
@@ -750,6 +805,10 @@ def render_schema(
         max_depth: Maximum nesting depth to render.  Structures deeper
                    than this are collapsed to ``{...}`` / ``[...]``.
                    ``None`` means unlimited.
+        enum_max: List the complete value set of string fields with at most
+                  this many distinct (repeating) values.  0 disables.
+        enum_exhaustive: Whether the samples covered every row (controls
+                  ``one of`` vs ``e.g. one of``).
     """
     return summary_to_schema(
         root_summary,
@@ -760,4 +819,6 @@ def render_schema(
         indent=0,
         inline=False,
         max_depth=max_depth,
+        enum_max=enum_max,
+        enum_exhaustive=enum_exhaustive,
     )
